@@ -14,6 +14,7 @@ document.body.appendChild(renderer.domElement);
 
 const COLORS = {
     WHITE: 0xffffff,
+    DEBUG_RED: 0xff0000,
     TREE_BROWN: 0x8b4513,
     LEAF_GREEN: 0x2e8b57,
     GRASS_LIGHT: 0x2ecc71,
@@ -68,56 +69,86 @@ camera.position.set(0, 10, 20);
 camera.lookAt(scene.position);
 
 ////////////////////////////////////////////////////////////////////////////
-// LANDSCAPE
+// TERRAIN
 ////////////////////////////////////////////////////////////////////////////
 function generateKnots(degree, numPoints) {
-    if (numPoints <= 0) return [];
-    const n = numPoints - 1; // Last control point index
+    /*
+        Generates unclamped knots, taken from lecture example code
+    */
+    const n = numPoints - 1;
     const p = degree;
     const knots = [];
 
-    // Repeat start knot (p+1) times (e.g., [0, 0, 0, 0...])
-    for(let i=0; i<=p; i++) knots.push(0);
-    
-    // Internal knots (uniformly spaced)
-    const count = n - p; 
-    if (count > 0) {
-        for(let i=1; i<=count; i++) knots.push(i / (count + 1));
-    }
-    
-    // Repeat end knot (p+1) times (e.g., ...1, 1, 1, 1])
-    for(let i=0; i<=p; i++) knots.push(1);
+    const len = n + p + 2;
+    for(let i=0; i<len; i++) knots.push(i / (len - 1));
 
     return knots;
 }
 
-function generatePatchControlPoints(dimension, heightData, minHeight=-4, maxHeight=4) {
+function generateChunkControlPoints(dimension, heightData, mapDim, globalXOffset, globalZOffset, weightScale, minHeight=-4, maxHeight=4) {
+    /*
+        Uses heightmap data to create control points for a chunk with the given heights
+    */
     const controlPoints = []
     for (let i = 0; i < dimension; i++) {
         const row = [];
-        for (let j = 0; j < dimension; j++) {
+        const xOffset = globalXOffset + i
 
-            const ind = (i + j * 16) * 4;
+        for (let j = 0; j < dimension; j++) {
+            const zOffset = j + globalZOffset
+
+            // find the index of the corresponding heightmap pixel
+            const ind = (xOffset + zOffset * mapDim) * 4;
+
+            // find how high this pixel is
             const heightRatio = heightData[ind] / 255;
+
+            const weight = 1 + heightRatio * weightScale;
         
-            const x = i - (dimension-1) / 2;
-            const y = minHeight + (maxHeight - minHeight) * heightRatio;
-            const z = j - (dimension-1) / 2;
+            const x = i;
+            const y = minHeight + (maxHeight - minHeight) * heightRatio;    // interpolate the height of this control point using the ratio
+            const z = j;
             
-            row.push(new THREE.Vector4(x, y, z, 1));
+            row.push(new THREE.Vector4(x, y, z, weight));
+
+            // visualise the control point for debugging
+            const point = new THREE.Mesh(
+                new THREE.SphereGeometry(0.1),
+                new THREE.MeshStandardMaterial({color: COLORS.DEBUG_RED})
+            )
+            point.position.set((globalXOffset+x)*terrainScale, y*terrainScale, (globalZOffset+z)*terrainScale);
+            scene.add(point);
         }
         controlPoints.push(row);
     }
     return controlPoints;
 }
 
-const patchDim = 16;
-const degree = 3; 
+function mapInternalSurface(u, v, target, surface, startT, endT) {
+    /*
+        Only render the surface for the internal control points
+    */
+    const range = endT - startT;
+    const newU = startT + (u * range);
+    const newV = startT + (v * range);
 
+    return surface.getPoint(newU, newV, target);
+}
+
+const chunkDim = 6;
+const chunkCount = 4;
+const degree = 3;
+const terrainScale = 1.5;
+
+// load the heightmap and process it
 const imgLoader = new THREE.ImageLoader();
-imgLoader.load('heightmap.png', (image) => processHeightmap(image, degree, patchDim, 1.5));
+imgLoader.load('heightmap.png', (image) => generateTerrain(image, degree, terrainScale));
 
-function processHeightmap(heightmap, degree, dimension, scale=1) {
+function generateTerrain(heightmap, degree, scale=1) {
+    /*
+        Generates the terrain as a parametric b-spline surface from a heightmap
+    */
+    // extract the pixel data from the heightmap
     const ctx = document.createElement('canvas').getContext('2d');
     const {width, height} = heightmap;
     ctx.canvas.width = width;
@@ -125,20 +156,32 @@ function processHeightmap(heightmap, degree, dimension, scale=1) {
     ctx.drawImage(heightmap, 0, 0);
     const {data} = ctx.getImageData(0, 0, width, height);
 
-    const knotsU = generateKnots(degree, width);
-    const knotsV = generateKnots(degree, width);
-    const controlPoints = generatePatchControlPoints(width, data, scale);
+    // generate the b-spline knots
+    const knots = generateKnots(degree, chunkDim);
 
-    const nurbsSurface = new NURBSSurface(degree, degree, knotsU, knotsV, controlPoints);
-
-    const geometry = new ParametricGeometry((u, v, target) => nurbsSurface.getPoint(u, v, target), 50, 50);
     const material = new THREE.MeshStandardMaterial({ color: COLORS.GRASS_LIGHT, side: THREE.DoubleSide, wireframe: false });
-    const terrain = new THREE.Mesh(geometry, material);
 
-    terrain.scale.set(scale, scale, scale);
-    terrain.position.y -= 2;
+    // create each chunk
+    for (let z = 0; z < chunkCount; z++) {
+        const zOffset = z * (chunkDim - 3);
+        for (let x = 0; x < chunkCount; x++) {
+            const xOffset = x * (chunkDim - 3);
 
-    scene.add(terrain);
+            // generate the chunk's control points according to the heightmap
+            const controlPoints = generateChunkControlPoints(chunkDim, data, width, xOffset, zOffset, 1, -2, 2);
+
+            // create the parametric suface according to the control points
+            const nurbsSurface = new NURBSSurface(degree, degree, knots, knots, controlPoints);
+            const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[degree], knots[chunkDim]), 25, 25)
+            const terrain = new THREE.Mesh(geometry, material);
+
+            // scale and position the chunk
+            terrain.scale.set(scale, scale, scale);
+            terrain.position.set(xOffset*terrainScale, 0, zOffset*terrainScale);
+
+            scene.add(terrain);
+        }
+    }
 }
 
 ////////////////////////////////////////////////////////////////////////////
