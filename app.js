@@ -15,6 +15,8 @@ document.body.appendChild(renderer.domElement);
 const COLORS = {
     WHITE: 0xffffff,
     DEBUG_RED: 0xff0000,
+    DEBUG_ORANGE: 0xf2ad0d,
+    DEBUG_YELLOW: 0xe4eb70,
     TREE_BROWN: 0x8b4513,
     LEAF_GREEN: 0x2e8b57,
     GRASS_LIGHT: 0x2ecc71,
@@ -24,6 +26,7 @@ const COLORS = {
 const STATE = {
     wireframe: false,
     show_points: false,
+    show_chunks: false,
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -33,20 +36,9 @@ const orbitControls = new OrbitControls(camera, renderer.domElement);
 orbitControls.enableDamping = true;
 orbitControls.dampingFactor = 0.05;
 
-const controls = {
-    moveSpeed: 1,
-    direction: {left: false, right: false, forward: false, backward: false, up: false, down: false},
-}
-
 window.addEventListener('keydown', (event) => {
     switch (event.key) {
-        case 'a': controls.direction.left = true; break;
-        case 'd': controls.direction.right = true; break;
-        case 'w': controls.direction.forward = true; break;
-        case 's': controls.direction.backward = true; break;
-        case 'e': controls.direction.up = true; break;
-        case 'q': controls.direction.down = true; break;
-        case 'p': 
+        case 'x': 
             STATE.wireframe = !STATE.wireframe;
             scene.traverse((object) => {
                 if (object instanceof THREE.Mesh) {
@@ -59,29 +51,34 @@ window.addEventListener('keydown', (event) => {
         case 'c':
             STATE.show_points = !STATE.show_points;
             controlPointsMesh.visible = STATE.show_points;
+            break;
+        case 'z':
+            STATE.show_chunks = !STATE.show_chunks;
+
+            for (let i = 0; i < TERRAIN_CONFIG.chunks.length; i++) {
+                let orangeMat = grassMat.clone();
+                let yellowMat = grassMat.clone();
+
+                orangeMat.color.set(COLORS.DEBUG_ORANGE);
+                yellowMat.color.set(COLORS.DEBUG_YELLOW);
+
+                TERRAIN_CONFIG.chunks[i].levels.forEach(level => {
+                    const obj = level.object;
+
+                    if (STATE.show_chunks) {
+                        if (i % 2 == 0) {
+                            obj.material = orangeMat;
+                        } else {
+                            obj.material = yellowMat;
+                        }
+                    } else {
+                        obj.material = grassMat;
+                    }
+                })
+            }
+            break;
     }
 })
-
-window.addEventListener('keyup', (event) => {
-    switch (event.key) {
-        case 'a': controls.direction.left = false; break;
-        case 'd': controls.direction.right = false; break;
-        case 'w': controls.direction.forward = false; break;
-        case 's': controls.direction.backward = false; break;
-        case 'e': controls.direction.up = false; break;
-        case 'q': controls.direction.down = false; break;
-    }
-})
-
-function updateCamera() {
-    if (controls.direction.left) camera.position.x -= controls.moveSpeed;
-    if (controls.direction.right) camera.position.x += controls.moveSpeed;
-    if (controls.direction.forward) camera.position.z -= controls.moveSpeed;
-    if (controls.direction.backward) camera.position.z += controls.moveSpeed;
-    if (controls.direction.up) camera.position.y += controls.moveSpeed;
-    if (controls.direction.down) camera.position.y -= controls.moveSpeed;
-    orbitControls.update();
-}
 
 camera.position.set(0, 20, 50);
 camera.lookAt(scene.position);
@@ -129,24 +126,23 @@ function generateChunkControlPoints(dimension, heightData, mapDim, globalXOffset
             
             const point = new THREE.Vector4(x, y, z, weight);
             row.push(point);
-            if (pushPoints) controlPoints.push(point);
+            if (pushPoints) TERRAIN_CONFIG.controlPoints.push(point);
         }
         chunkControlPoints.push(row);
     }
     return chunkControlPoints;
 }
 
-function generateTerrainMesh(data, degree, chunkDim, mapDim, knots, lods, pushPoints=true) {
+function generateTerrainMesh(data, degree, chunkDim, mapDim, knots, lods, pushPoints=true, tearBlock=false) {
     /*
         Generates the terrain mesh as a parametric b-spline surface from a heightmap
     */
-    const material = new THREE.MeshStandardMaterial({ color: COLORS.GRASS_LIGHT, side: THREE.BackSide});
     const terrain = new THREE.Group();
 
     // create each chunk
-    for (let z = 0; z < chunkCount; z++) {
+    for (let z = 0; z < TERRAIN_CONFIG.chunkCount; z++) {
         const zOffset = z * (chunkDim - 3);
-        for (let x = 0; x < chunkCount; x++) {
+        for (let x = 0; x < TERRAIN_CONFIG.chunkCount; x++) {
             const xOffset = x * (chunkDim - 3);
 
             // generate the chunk's control points according to the heightmap
@@ -156,11 +152,27 @@ function generateTerrainMesh(data, degree, chunkDim, mapDim, knots, lods, pushPo
             const nurbsSurface = new NURBSSurface(degree, degree, knots, knots, chunkControlPoints);
             const lod = new THREE.LOD();
 
-            // create all the levels of detail
-            for (let i = 0; i < lods.length; i++) {
-                const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[degree], knots[chunkDim]), lods[i][0], lods[i][0])
-                const chunk = new THREE.Mesh(geometry, material);
-                lod.addLevel(chunk, lods[i][1]);
+            if (tearBlock) {
+                // add the low res terrain under the main terrain to catch tears
+                const culledChunk = new THREE.Object3D();
+                lod.addLevel(culledChunk, 0);
+
+                const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[degree], knots[chunkDim]), 1, 1)
+
+                // create rings of visible chunks around boundaries and cull the others since they won't be visible
+                for (let i = 1; i < lods.length; i++) {
+                    const chunk = new THREE.Mesh(geometry, grassMat);
+                    lod.addLevel(chunk, lods[i][1]);
+                    lod.addLevel(culledChunk, lods[i][1]+20);
+                }
+            } else {
+                // create all the levels of detail
+                for (let i = 0; i < lods.length; i++) {
+                    const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[degree], knots[chunkDim]), lods[i][0], lods[i][0])
+                    const chunk = new THREE.Mesh(geometry, grassMat);
+                    lod.addLevel(chunk, lods[i][1]);
+                }
+                TERRAIN_CONFIG.chunks.push(lod);
             }
 
             // position the chunk
@@ -170,8 +182,6 @@ function generateTerrainMesh(data, degree, chunkDim, mapDim, knots, lods, pushPo
     }
     return terrain;
 }
-
-
 
 function mapInternalSurface(u, v, target, surface, startT, endT) {
     /*
@@ -184,17 +194,23 @@ function mapInternalSurface(u, v, target, surface, startT, endT) {
     surface.getPoint(newU, newV, target);
 }
 
-// chunk count must be a factor of heightmap dimension-3
-const chunkCount = 25;
-const degree = 3;
-const terrainScale = 1;
+const TERRAIN_CONFIG = {
+    heightmap: 'heightmap2.png',
+    chunkCount: 25,
+    chunkDim: 8,
+    degree: 3,
+    terrainScale: 1,
+    lod_levels: [[15, 0], [5, 20], [3, 50]],
+    controlPoints: [],
+    chunks: [],
+}
 
-const controlPoints = [];
+const grassMat = new THREE.MeshStandardMaterial({ color: COLORS.GRASS_LIGHT, side: THREE.BackSide});
 let controlPointsMesh;
 
 // load the heightmap and process it
 const imgLoader = new THREE.ImageLoader();
-imgLoader.load('heightmap2.png', (image) => generateTerrain(image, degree, terrainScale));
+imgLoader.load(TERRAIN_CONFIG.heightmap, (image) => generateTerrain(image, TERRAIN_CONFIG.degree, TERRAIN_CONFIG.terrainScale));
 
 function generateTerrain(heightmap, degree, scale=1) {
     /*
@@ -208,41 +224,45 @@ function generateTerrain(heightmap, degree, scale=1) {
     ctx.drawImage(heightmap, 0, 0);
     const {data} = ctx.getImageData(0, 0, width, height);
 
-    // calculate the necessary chunk dimension so the specified number of chunks can be made
-    const chunkDim = ((width-3)/chunkCount)+3;
+    // round the number of chunks per axis to the nearest factor of the map size-3
+    while ((width-3) % TERRAIN_CONFIG.chunkCount > 0) {
+        if (TERRAIN_CONFIG.chunkCount == 1) break;
+        TERRAIN_CONFIG.chunkCount--;
+    }
+
+    // calculate the necessary chunk dimension so the number of points matches the map size
+    TERRAIN_CONFIG.chunkDim = ((width-3)/TERRAIN_CONFIG.chunkCount)+3;
 
     // generate the b-spline knots
-    const knots = generateKnots(degree, chunkDim);
-
-    const meshWidth = ((chunkCount-1) * (chunkDim - 3)) + chunkDim - 1
+    const knots = generateKnots(degree, TERRAIN_CONFIG.chunkDim);
 
     // generate the terrain mesh
-    const terrain = generateTerrainMesh(data, degree, chunkDim, width, knots, [[15, 15], [5, 20], [3, 50]]);
-    terrain.position.set(-(meshWidth)/2, 0, -(meshWidth)/2);
+    const terrain = generateTerrainMesh(data, degree, TERRAIN_CONFIG.chunkDim, width, knots, TERRAIN_CONFIG.lod_levels);
+    terrain.position.set(-(width)/2, 0, -(width)/2);
     terrain.scale.setScalar(scale);
     scene.add(terrain);
 
     // the lods cause tearing so a low resolution version of the terrain is added underneath to visually hide tears
-    const gapBlock = generateTerrainMesh(data, degree, chunkDim, width, knots, [[1, 50]], false);
-    gapBlock.position.set(-(meshWidth)/2, -2, -(meshWidth)/2);
-    gapBlock.scale.setScalar(scale);
-    scene.add(gapBlock);
+    const tearBlock = generateTerrainMesh(data, degree, TERRAIN_CONFIG.chunkDim, width, knots, TERRAIN_CONFIG.lod_levels, false, true);
+    tearBlock.position.set(-(width)/2, -1, -(width)/2);
+    tearBlock.scale.setScalar(scale);
+    scene.add(tearBlock);
 
     // visualise the control points for debugging
-    controlPointsMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.1, 3, 2), new THREE.MeshStandardMaterial({color: COLORS.DEBUG_RED}), controlPoints.length);
-    controlPointsMesh.position.set(-meshWidth/2, 0, -meshWidth/2);
+    controlPointsMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.2, 3, 2), new THREE.MeshStandardMaterial({color: COLORS.DEBUG_RED}), TERRAIN_CONFIG.controlPoints.length);
+    controlPointsMesh.position.set(-width/2, 0, -width/2);
     controlPointsMesh.visible = STATE.show_points;
 
     // set the positions for each control point
     const dummy = new THREE.Object3D();
     let ind = 0
-    for (let z = 0; z < chunkCount; z++) {
-        const zOffset = z * (chunkDim - 3);
-        for (let x = 0; x < chunkCount; x++) {
-            const xOffset = x * (chunkDim - 3);
-            for (let i = 0; i < chunkDim; i++) {
-                for (let j = 0; j < chunkDim; j++) {
-                    const p = controlPoints[ind];
+    for (let z = 0; z < TERRAIN_CONFIG.chunkCount; z++) {
+        const zOffset = z * (TERRAIN_CONFIG.chunkDim - 3);
+        for (let x = 0; x < TERRAIN_CONFIG.chunkCount; x++) {
+            const xOffset = x * (TERRAIN_CONFIG.chunkDim - 3);
+            for (let i = 0; i < TERRAIN_CONFIG.chunkDim; i++) {
+                for (let j = 0; j < TERRAIN_CONFIG.chunkDim; j++) {
+                    const p = TERRAIN_CONFIG.controlPoints[ind];
 
                     dummy.position.set((p.x + xOffset)*scale, p.y*scale, (p.z+zOffset)*scale);
                     dummy.updateMatrix();
@@ -273,7 +293,7 @@ scene.fog = new THREE.FogExp2(0x87CEEB, 0.005);
 ////////////////////////////////////////////////////////////////////////////
 function animate() {
     requestAnimationFrame(animate);
-    updateCamera();
+    orbitControls.update();
 
     scene.traverse((object) => {
         if (object instanceof THREE.LOD) {
