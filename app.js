@@ -21,6 +21,11 @@ const COLORS = {
     SKY_BLUE: 0x87ceeb,
 }
 
+const STATE = {
+    wireframe: false,
+    show_points: false,
+}
+
 ////////////////////////////////////////////////////////////////////////////
 // CAMERA
 ////////////////////////////////////////////////////////////////////////////
@@ -41,6 +46,19 @@ window.addEventListener('keydown', (event) => {
         case 's': controls.direction.backward = true; break;
         case 'e': controls.direction.up = true; break;
         case 'q': controls.direction.down = true; break;
+        case 'p': 
+            STATE.wireframe = !STATE.wireframe;
+            scene.traverse((object) => {
+                if (object instanceof THREE.Mesh) {
+                    if (object.material) {
+                        object.material.wireframe = STATE.wireframe;
+                    }
+                }
+            });
+            break;
+        case 'c':
+            STATE.show_points = !STATE.show_points;
+            controlPointsMesh.visible = STATE.show_points;
     }
 })
 
@@ -65,7 +83,7 @@ function updateCamera() {
     orbitControls.update();
 }
 
-camera.position.set(0, 10, 20);
+camera.position.set(0, 20, 50);
 camera.lookAt(scene.position);
 
 ////////////////////////////////////////////////////////////////////////////
@@ -85,11 +103,11 @@ function generateKnots(degree, numPoints) {
     return knots;
 }
 
-function generateChunkControlPoints(dimension, heightData, mapDim, globalXOffset, globalZOffset, weightScale, minHeight=-4, maxHeight=4) {
+function generateChunkControlPoints(dimension, heightData, mapDim, globalXOffset, globalZOffset, weightScale, minHeight=-4, maxHeight=4, pushPoints = true) {
     /*
         Uses heightmap data to create control points for a chunk with the given heights
     */
-    const controlPoints = []
+    const chunkControlPoints = []
     for (let i = 0; i < dimension; i++) {
         const row = [];
         const xOffset = globalXOffset + i
@@ -109,20 +127,51 @@ function generateChunkControlPoints(dimension, heightData, mapDim, globalXOffset
             const y = minHeight + (maxHeight - minHeight) * heightRatio;    // interpolate the height of this control point using the ratio
             const z = j;
             
-            row.push(new THREE.Vector4(x, y, z, weight));
-
-            // visualise the control point for debugging
-            const point = new THREE.Mesh(
-                new THREE.SphereGeometry(0.1),
-                new THREE.MeshStandardMaterial({color: COLORS.DEBUG_RED})
-            )
-            point.position.set((globalXOffset+x)*terrainScale, y*terrainScale, (globalZOffset+z)*terrainScale);
-            scene.add(point);
+            const point = new THREE.Vector4(x, y, z, weight);
+            row.push(point);
+            if (pushPoints) controlPoints.push(point);
         }
-        controlPoints.push(row);
+        chunkControlPoints.push(row);
     }
-    return controlPoints;
+    return chunkControlPoints;
 }
+
+function generateTerrainMesh(data, degree, chunkDim, mapDim, knots, lods, pushPoints=true) {
+    /*
+        Generates the terrain mesh as a parametric b-spline surface from a heightmap
+    */
+    const material = new THREE.MeshStandardMaterial({ color: COLORS.GRASS_LIGHT, side: THREE.BackSide});
+    const terrain = new THREE.Group();
+
+    // create each chunk
+    for (let z = 0; z < chunkCount; z++) {
+        const zOffset = z * (chunkDim - 3);
+        for (let x = 0; x < chunkCount; x++) {
+            const xOffset = x * (chunkDim - 3);
+
+            // generate the chunk's control points according to the heightmap
+            const chunkControlPoints = generateChunkControlPoints(chunkDim, data, mapDim, xOffset, zOffset, 1, -2, 5, pushPoints);
+
+            // create the parametric suface according to the control points
+            const nurbsSurface = new NURBSSurface(degree, degree, knots, knots, chunkControlPoints);
+            const lod = new THREE.LOD();
+
+            // create all the levels of detail
+            for (let i = 0; i < lods.length; i++) {
+                const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[degree], knots[chunkDim]), lods[i][0], lods[i][0])
+                const chunk = new THREE.Mesh(geometry, material);
+                lod.addLevel(chunk, lods[i][1]);
+            }
+
+            // position the chunk
+            lod.position.set(xOffset, 0, zOffset);
+            terrain.add(lod);
+        }
+    }
+    return terrain;
+}
+
+
 
 function mapInternalSurface(u, v, target, surface, startT, endT) {
     /*
@@ -132,21 +181,24 @@ function mapInternalSurface(u, v, target, surface, startT, endT) {
     const newU = startT + (u * range);
     const newV = startT + (v * range);
 
-    return surface.getPoint(newU, newV, target);
+    surface.getPoint(newU, newV, target);
 }
 
-const chunkDim = 6;
-const chunkCount = 4;
+// chunk count must be a factor of heightmap dimension-3
+const chunkCount = 25;
 const degree = 3;
-const terrainScale = 1.5;
+const terrainScale = 1;
+
+const controlPoints = [];
+let controlPointsMesh;
 
 // load the heightmap and process it
 const imgLoader = new THREE.ImageLoader();
-imgLoader.load('heightmap.png', (image) => generateTerrain(image, degree, terrainScale));
+imgLoader.load('heightmap2.png', (image) => generateTerrain(image, degree, terrainScale));
 
 function generateTerrain(heightmap, degree, scale=1) {
     /*
-        Generates the terrain as a parametric b-spline surface from a heightmap
+        Generates the terrain
     */
     // extract the pixel data from the heightmap
     const ctx = document.createElement('canvas').getContext('2d');
@@ -156,32 +208,53 @@ function generateTerrain(heightmap, degree, scale=1) {
     ctx.drawImage(heightmap, 0, 0);
     const {data} = ctx.getImageData(0, 0, width, height);
 
+    // calculate the necessary chunk dimension so the specified number of chunks can be made
+    const chunkDim = ((width-3)/chunkCount)+3;
+
     // generate the b-spline knots
     const knots = generateKnots(degree, chunkDim);
 
-    const material = new THREE.MeshStandardMaterial({ color: COLORS.GRASS_LIGHT, side: THREE.DoubleSide, wireframe: false });
+    const meshWidth = ((chunkCount-1) * (chunkDim - 3)) + chunkDim - 1
 
-    // create each chunk
+    // generate the terrain mesh
+    const terrain = generateTerrainMesh(data, degree, chunkDim, width, knots, [[15, 15], [5, 20], [3, 50]]);
+    terrain.position.set(-(meshWidth)/2, 0, -(meshWidth)/2);
+    terrain.scale.setScalar(scale);
+    scene.add(terrain);
+
+    // the lods cause tearing so a low resolution version of the terrain is added underneath to visually hide tears
+    const gapBlock = generateTerrainMesh(data, degree, chunkDim, width, knots, [[1, 50]], false);
+    gapBlock.position.set(-(meshWidth)/2, -2, -(meshWidth)/2);
+    gapBlock.scale.setScalar(scale);
+    scene.add(gapBlock);
+
+    // visualise the control points for debugging
+    controlPointsMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.1, 3, 2), new THREE.MeshStandardMaterial({color: COLORS.DEBUG_RED}), controlPoints.length);
+    controlPointsMesh.position.set(-meshWidth/2, 0, -meshWidth/2);
+    controlPointsMesh.visible = STATE.show_points;
+
+    // set the positions for each control point
+    const dummy = new THREE.Object3D();
+    let ind = 0
     for (let z = 0; z < chunkCount; z++) {
         const zOffset = z * (chunkDim - 3);
         for (let x = 0; x < chunkCount; x++) {
             const xOffset = x * (chunkDim - 3);
+            for (let i = 0; i < chunkDim; i++) {
+                for (let j = 0; j < chunkDim; j++) {
+                    const p = controlPoints[ind];
 
-            // generate the chunk's control points according to the heightmap
-            const controlPoints = generateChunkControlPoints(chunkDim, data, width, xOffset, zOffset, 1, -2, 2);
+                    dummy.position.set((p.x + xOffset)*scale, p.y*scale, (p.z+zOffset)*scale);
+                    dummy.updateMatrix();
 
-            // create the parametric suface according to the control points
-            const nurbsSurface = new NURBSSurface(degree, degree, knots, knots, controlPoints);
-            const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[degree], knots[chunkDim]), 25, 25)
-            const terrain = new THREE.Mesh(geometry, material);
-
-            // scale and position the chunk
-            terrain.scale.set(scale, scale, scale);
-            terrain.position.set(xOffset*terrainScale, 0, zOffset*terrainScale);
-
-            scene.add(terrain);
+                    controlPointsMesh.setMatrixAt(ind, dummy.matrix);
+                    ind++;
+                }
+            }
         }
     }
+
+    scene.add(controlPointsMesh);
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -201,6 +274,13 @@ scene.fog = new THREE.FogExp2(0x87CEEB, 0.005);
 function animate() {
     requestAnimationFrame(animate);
     updateCamera();
+
+    scene.traverse((object) => {
+        if (object instanceof THREE.LOD) {
+            object.update(camera);
+        }
+    });
+
     renderer.render(scene, camera);
 }
 
