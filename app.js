@@ -5,6 +5,7 @@ import {ParametricGeometry} from 'three/addons/geometries/ParametricGeometry.js'
 import {SimplexNoise} from 'three/addons/math/SimplexNoise.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import {computeBoundsTree, disposeBoundsTree, acceleratedRaycast, BVHHelper} from 'three-mesh-bvh';
+import {InstancedMesh2} from '@three.ez/instanced-mesh';
 
 ////////////////////////////////////////////////////////////////////////////
 // SETUP
@@ -24,6 +25,7 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const upVec = new THREE.Vector3(0, 1, 0);
+const dummy = new THREE.Object3D();
 
 const COLOURS = {
     WHITE: 0xffffff,
@@ -43,7 +45,7 @@ const COLOURS = {
 }
 
 const STATE = {
-    wireframe: false,
+    show_wireframe: false,
     show_points: false,
     show_chunks: false,
     show_bvh: false,
@@ -59,11 +61,11 @@ orbitControls.dampingFactor = 0.05;
 window.addEventListener('keydown', (event) => {
     switch (event.key) {
         case 'x': 
-            STATE.wireframe = !STATE.wireframe;
+            STATE.show_wireframe = !STATE.show_wireframe;
             scene.traverse((object) => {
                 if (object instanceof THREE.Mesh) {
                     if (object.material) {
-                        object.material.wireframe = STATE.wireframe;
+                        object.material.wireframe = STATE.show_wireframe;
                     }
                 }
             });
@@ -76,8 +78,8 @@ window.addEventListener('keydown', (event) => {
             STATE.show_chunks = !STATE.show_chunks;
 
             for (let i = 0; i < MAP_CONFIG.chunks.length; i++) {
-                let orangeMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_ORANGE, side: THREE.BackSide, wireframe: STATE.wireframe});
-                let yellowMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_YELLOW, side: THREE.BackSide, wireframe: STATE.wireframe});
+                let orangeMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_ORANGE, side: THREE.BackSide, wireframe: STATE.show_wireframe});
+                let yellowMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_YELLOW, side: THREE.BackSide, wireframe: STATE.show_wireframe});
 
                 orangeMat.color.set(COLOURS.DEBUG_ORANGE);
                 yellowMat.color.set(COLOURS.DEBUG_YELLOW);
@@ -109,6 +111,7 @@ window.addEventListener('keydown', (event) => {
         case 'b':
             STATE.show_bvh = !STATE.show_bvh;
             octree.visible = STATE.show_bvh;
+            break;
     }
 })
 
@@ -122,6 +125,7 @@ let octree;
 ////////////////////////////////////////////////////////////////////////////
 const camWorldPos = new THREE.Vector3();
 const objWorldPos = new THREE.Vector3();
+const tempVec = new THREE.Vector3();
 
 function updateLOD(obj) {
     /*
@@ -241,8 +245,9 @@ function generateTerrain(data, knots, noise, pushPoints=true, tearBlock=false) {
                 for (let i = 1; i < MAP_CONFIG.lod_levels.length; i++) {
                     const chunk = new THREE.Mesh(geometry, grassMat);
                     lod.addLevel(chunk, MAP_CONFIG.lod_levels[i][1]);
-                    lod.addLevel(culledChunk, MAP_CONFIG.lod_levels[i][1]+3000);
+                    lod.addLevel(culledChunk, MAP_CONFIG.lod_levels[i][1]+5000);
                 }
+                MAP_CONFIG.tearBlocks.push(lod);
             } else {
                 // create all the levels of detail
                 for (let i = 0; i < MAP_CONFIG.lod_levels.length; i++) {
@@ -252,8 +257,7 @@ function generateTerrain(data, knots, noise, pushPoints=true, tearBlock=false) {
 
                     // compute the bound volume tree for efficient raycasting
                     geometry.computeBoundsTree();
-                    const visualizer = new BVHHelper(chunk);
-                    octree.add(visualizer);
+                    octree.add(new BVHHelper(chunk));
                 }
                 MAP_CONFIG.chunks.push(lod);
             }
@@ -289,10 +293,12 @@ const MAP_CONFIG = {
     terrainScale: 2,
     terrainNoiseFreq: 0.03,
     terrainNoiseScale: 1.5,
-    lod_levels: [[25, 0], [15, 2500], [8, 10000]],
+    lod_levels: [[25, 0], [15, 2500], [8, 15000]],
     controlPoints: [],
     chunks: [],
-    chunkObjs: [],
+    tearBlocks: [],
+    treesInstances: [],
+    treeCount: 0,
 }
 
 const grassMat = new THREE.MeshLambertMaterial({color: COLOURS.GRASS_GREEN, side: THREE.BackSide});
@@ -364,10 +370,10 @@ function generateMap(heightmap) {
 
     // create and place the cathedral
     const cathedralChunk = MAP_CONFIG.chunks[119];
-    raycaster.ray.origin.set(cathedralChunk.position.x+9, 50, cathedralChunk.position.z+4);
+    raycaster.ray.origin.set(cathedralChunk.position.x+9, 50, cathedralChunk.position.z+2);
     const hit = raycaster.intersectObject(cathedralChunk.levels[0].object);
 
-    const cathedral = createCathedral(hit[0].point, 1.1);
+    const cathedral = createCathedral(hit[0].point, 1);
     map.add(cathedral);
 
     // create and place bridges
@@ -375,46 +381,43 @@ function generateMap(heightmap) {
     const bridge1 = createBridge(new THREE.Vector3(bridge1Chunk.position.x+5, 4.5, bridge1Chunk.position.z+8), 0, Math.PI/32);
 
     const bridge2Chunk = MAP_CONFIG.chunks[138];
-    const bridge2 = createBridge(new THREE.Vector3(bridge2Chunk.position.x+3, 3.5, bridge2Chunk.position.z+8), -Math.PI/4, -Math.PI/16);
+    const bridge2 = createBridge(new THREE.Vector3(bridge2Chunk.position.x+3, 3.5, bridge2Chunk.position.z+6), -Math.PI/4, -Math.PI/20);
 
     map.add(bridge1);
     map.add(bridge2);
 
-    // const chunkI = 119;
-    // const arrowHelper = new THREE.ArrowHelper(
-    //     new THREE.Vector3(0, -1, 0), 
-    //     new THREE.Vector3(MAP_CONFIG.chunks[chunkI].position.x+1, 50, MAP_CONFIG.chunks[chunkI].position.z+1), 
-    //     100, 
-    //     0xff0000 
-    // );
-    // map.add(arrowHelper);
-
-    const dummy = new THREE.Object3D();
-    MAP_CONFIG.chunkObjs = new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount).fill().map(() => []);
+    // the positions of objects within each chunk
+    const chunkObjs = new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount).fill().map(() => []);
 
     // create instanced meshes for buildings
-    const buildingMesh = new THREE.InstancedMesh(buildingGeometry, buildingMaterial, buildingCount);
-    const roofMesh = new THREE.InstancedMesh(roofGeometry, roofMaterial, buildingCount);
+    const buildingMesh = new InstancedMesh2(buildingGeometry, buildingMaterial, { capacity: buildingCount });
+    const roofMesh = new InstancedMesh2(roofGeometry, roofMaterial, { capacity: buildingCount });
+    const buildingInstances = [buildingMesh, roofMesh];    
 
     map.add(buildingMesh);
     map.add(roofMesh);
-
-    const buildingInstances = [buildingMesh, roofMesh];
-    placeInstanceObjects(buildingInstances, raycaster, buildingCount, dummy, 1, 0.3, 2.5);
+    placeInstanceObjects(buildingInstances, raycaster, chunkObjs, buildingCount, dummy, 0.8, 0.3, 1.5);
 
     // create instanced meshes for the trees
-    const trunkMesh = new THREE.InstancedMesh(trunkGeometry, trunkMaterial, treeCount);
-    const leavesMesh = new THREE.InstancedMesh(leavesGeometry, leavesMaterial, treeCount);
+    const trunkMesh = new InstancedMesh2(trunkGeometryHigh, trunkMaterial, { capacity: treeCount });
+    const leavesMesh = new InstancedMesh2(leavesGeometryHigh, leavesMaterial, { capacity: treeCount });
+
+    trunkMesh.addLOD(trunkGeometryLow, trunkMaterial, 50)
+    trunkMesh.addLOD(trunkGeometryImposter, trunkMaterial, 120)
+    leavesMesh.addLOD(leavesGeometryLow, leavesMaterial, 70)
+    leavesMesh.addLOD(leavesGeometryImposter, leavesMaterial, 120)
+
+    MAP_CONFIG.treesInstances = [trunkMesh, leavesMesh];
 
     map.add(trunkMesh);
     map.add(leavesMesh);
-
-    const treeInstances = [trunkMesh, leavesMesh];
-    placeInstanceObjects(treeInstances, raycaster, treeCount, dummy, 0.25, 0.25, 3);
+    MAP_CONFIG.treeCount = placeInstanceObjects(MAP_CONFIG.treesInstances, raycaster, chunkObjs, treeCount, dummy, 0.2, 0.25, 2.5);
 
     // visualise the control points for debugging
-    controlPointsMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.2, 3, 2), new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_RED}), MAP_CONFIG.controlPoints.length);
+    controlPointsMesh = new InstancedMesh2(new THREE.SphereGeometry(0.4, 3, 2), new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_RED}), {capacity: MAP_CONFIG.controlPoints.length});
     controlPointsMesh.visible = STATE.show_points;
+
+    controlPointsMesh.addInstances(MAP_CONFIG.controlPoints.length);
 
     // set the positions for each control point
     let ind = 0
@@ -446,6 +449,7 @@ function generateMap(heightmap) {
         if (object.isMesh || object.isLOD) {
             object.matrixAutoUpdate = false;
             object.updateMatrix();
+            object.updateMatrixWorld();
         }
     });
 
@@ -459,15 +463,23 @@ function generateMap(heightmap) {
 const chunkIgnore = [87, 88, 103, 104, 119, 120]
 
 // create the tree components
-const trunkGeometry = new THREE.CylinderGeometry(0.3, 0.5, 2, 6);
+const trunkGeometryHigh = new THREE.CylinderGeometry(0.3, 0.5, 2, 6);
+const trunkGeometryLow = new THREE.BoxGeometry(0.7, 2, 0.7);
+const trunkGeometryImposter = new THREE.PlaneGeometry(0.7, 2);
 const trunkMaterial = new THREE.MeshLambertMaterial({color: COLOURS.TREE_BROWN});
-trunkGeometry.translate(0, 1.0, 0); 
+trunkGeometryHigh.translate(0, 1.0, 0); 
+trunkGeometryLow.translate(0, 1.0, 0); 
+trunkGeometryImposter.translate(0, 1.0, 0); 
 
-const leavesGeometry = new THREE.ConeGeometry(2, 4, 6);
+const leavesGeometryHigh = new THREE.ConeGeometry(2, 4, 6);
+const leavesGeometryLow = new THREE.ConeGeometry(2, 4, 4);
+const leavesGeometryImposter = new THREE.ConeGeometry(2, 4, 2); // this creates a single triangle
 const leavesMaterial = new THREE.MeshLambertMaterial({color: COLOURS.LEAF_GREEN});
-leavesGeometry.translate(0, 4.0, 0);
+leavesGeometryHigh.translate(0, 4.0, 0);
+leavesGeometryLow.translate(0, 4.0, 0);
+leavesGeometryImposter.translate(0, 4.0, 0);
 
-const treeCount = 2000;
+const treeCount = 4000;
 
 // create the building components
 const buildingGeometry = new THREE.BoxGeometry(1, 2, 1);
@@ -485,12 +497,16 @@ const buildingCount = 1000;
 const towerGeometry = new THREE.BoxGeometry(4, 9, 4);
 const towerMaterial = new THREE.MeshLambertMaterial({color: COLOURS.BUILDING_BEIGE});
 
+towerGeometry.computeBoundsTree();
+
 const towerRoofGeometry = new THREE.ConeGeometry(3.5, 1, 4);
 const towerRoofMaterial = new THREE.MeshLambertMaterial({color: COLOURS.ROOF_GREY});
 
-const bridgeGeometry = new THREE.BoxGeometry(23, 2, 3);
+const bridgeGeometry = new THREE.BoxGeometry(25, 2, 3);
 
-function placeInstanceObjects(instances, raycaster, count, dummy, scale, scaleVariation, minDist) {
+bridgeGeometry.computeBoundsTree();
+
+function placeInstanceObjects(instances, raycaster, chunkObjs, count, dummy, scale, scaleVariation, minDist) {
     /*
         Places objects from mesh instances onto the map
         A raycaster is used to determine position
@@ -522,7 +538,7 @@ function placeInstanceObjects(instances, raycaster, count, dummy, scale, scaleVa
 
             // check if adding this object would intersect with another object in this chunk
             let intersects = false;
-            for (const objPos of MAP_CONFIG.chunkObjs[chunkInd]) {
+            for (const objPos of chunkObjs[chunkInd]) {
                 const dx = position.x - objPos[0];
                 const dz = position.z - objPos[1];
                 if (dx*dx + dz*dz < minDist) {
@@ -533,12 +549,14 @@ function placeInstanceObjects(instances, raycaster, count, dummy, scale, scaleVa
 
             if (intersects) continue;
 
+            instances.forEach(instance => instance.addInstances(1));
+
             // set the transform of the object
             dummy.position.copy(position);
             dummy.rotation.y = Math.random() * Math.PI;
             dummy.scale.setScalar(scale + Math.random()*scaleVariation);
 
-            MAP_CONFIG.chunkObjs[chunkInd].push([position.x, position.z]);
+            chunkObjs[chunkInd].push([position.x, position.z]);
             
             dummy.updateMatrix();
             instances.forEach(instance => instance.setMatrixAt(hits, dummy.matrix));
@@ -547,15 +565,47 @@ function placeInstanceObjects(instances, raycaster, count, dummy, scale, scaleVa
         }
     }
 
-    // only render the number of objects that were placed
-    instances.forEach(instance => instance.count = hits);
+    return hits
+}
+
+function checkImposter() {
+    /*
+        Checks each tree and makes it rotate to face the camera if it's an imposter
+    */
+    for (let i = 0; i < MAP_CONFIG.treeCount; i++) {
+
+        // get the corresponding tree's components
+        MAP_CONFIG.treesInstances[0].getMatrixAt(i, dummy.matrix);
+        dummy.matrix.decompose(dummy.position, dummy.quaternion, dummy.scale);
+
+        // convert the camera's position into the trees' local space position
+        tempVec.copy(camWorldPos);
+        MAP_CONFIG.treesInstances[0].worldToLocal(tempVec);
+
+        if (tempVec.distanceTo(dummy.position) > 119) {
+
+            // make the imposter face the camera
+            tempVec.y = dummy.position.y;
+            dummy.lookAt(tempVec);
+            dummy.updateMatrix();
+
+            MAP_CONFIG.treesInstances[0].setMatrixAt(i, dummy.matrix)
+
+            // the leaves are a single triangle that needs to be rotated by 90 degrees
+            dummy.rotateY(Math.PI/2);
+            dummy.updateMatrix();
+
+            MAP_CONFIG.treesInstances[1].setMatrixAt(i, dummy.matrix)
+        }
+    }
 }
 
 function createBridge(position, rotY, rotZ) {
     const bridgeMesh = new THREE.Mesh(bridgeGeometry, towerMaterial);
     bridgeMesh.position.set(position.x, position.y, position.z);
-
     bridgeMesh.quaternion.setFromEuler(new THREE.Euler(0, rotY, rotZ));
+
+    octree.add(new BVHHelper(bridgeMesh));
 
     return bridgeMesh
 }
@@ -608,12 +658,16 @@ function createCathedral(position, scale) {
 
     cathedral.position.set(position.x, position.y-0.5, position.z);
     cathedral.scale.setScalar(scale);
+    
+    cathedral.children.forEach(mesh => octree.add(new BVHHelper(mesh)))
+    
     return cathedral
 }
 
 ////////////////////////////////////////////////////////////////////////////
 // EFFECTS & LIGHTING
 ////////////////////////////////////////////////////////////////////////////
+
 function addBaseLight() {
     const sun = new THREE.DirectionalLight(COLOURS.WHITE, 1.5);
     sun.position.set(50, 100, 50);
@@ -645,11 +699,11 @@ function animate() {
 
     // only update lods every 20 frames
     if (frame % 20 == 0) {
-        scene.traverse((object) => {
-            if (object.isLOD) {
-                updateLOD(object);
-            }
-        });
+        MAP_CONFIG.chunks.forEach(chunk => updateLOD(chunk));
+        MAP_CONFIG.tearBlocks.forEach(tearBlock => updateLOD(tearBlock));        
+
+        checkImposter();
+        
         frame = 0;
     }
     frame++;
