@@ -5,7 +5,6 @@ import {ParametricGeometry} from 'three/addons/geometries/ParametricGeometry.js'
 import {SimplexNoise} from 'three/addons/math/SimplexNoise.js';
 import Stats from 'three/addons/libs/stats.module.js';
 import {computeBoundsTree, disposeBoundsTree, acceleratedRaycast, BVHHelper} from 'three-mesh-bvh';
-import {InstancedMesh2} from '@three.ez/instanced-mesh';
 
 ////////////////////////////////////////////////////////////////////////////
 // SETUP
@@ -25,7 +24,7 @@ THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
 THREE.Mesh.prototype.raycast = acceleratedRaycast;
 
 const upVec = new THREE.Vector3(0, 1, 0);
-const dummy = new THREE.Object3D();
+let mapLoaded = false;
 
 const COLOURS = {
     WHITE: 0xffffff,
@@ -106,6 +105,7 @@ window.addEventListener('keydown', (event) => {
             while(scene.children.length > 0){ 
                 scene.remove(scene.children[0]); 
             }
+            mapLoaded = false;
             init();
             break;
         case 'b':
@@ -123,42 +123,50 @@ let octree;
 ////////////////////////////////////////////////////////////////////////////
 // UTILITY
 ////////////////////////////////////////////////////////////////////////////
-const camWorldPos = new THREE.Vector3();
-const objWorldPos = new THREE.Vector3();
 const tempVec = new THREE.Vector3();
+const tempVec2 = new THREE.Vector3();
+const dummy = new THREE.Object3D();
 
-function updateLOD(obj) {
+const raycaster = new THREE.Raycaster();
+raycaster.firstHitOnly = true;
+
+function updateChunks() {
     /*
-        A more efficient lod update check using the squared distance
-        Adapted from the three.js source code
+        Updates the lods of each chunk and sets tear block visibility
     */
-    const levels = obj.levels;
-    const numLevels = levels.length;
+    for (let i = 0; i < MAP_CONFIG.chunks.length; i++) {
+        const chunk = MAP_CONFIG.chunks[i];
+        MAP_CONFIG.tearBlocks[i].visible = false;
 
-    camera.getWorldPosition(camWorldPos);
-    obj.getWorldPosition(objWorldPos);
+        const levels = chunk.levels;
+        const numLevels = levels.length;
 
-    const sqrDis = objWorldPos.distanceToSquared(camWorldPos);
+        chunk.getWorldPosition(tempVec);
+        const sqrDis = tempVec.distanceToSquared(camera.position);
 
-    levels[0].object.visible = true;
+        MAP_CONFIG.chunkDists[i] = sqrDis;
 
-    let i = 1;
+        levels[0].object.visible = true;
 
-    for (; i < numLevels; i++) {
+        let j = 1;
+        for (; j < numLevels; j++) {
 
-        let levelDistance = levels[i].distance;
+            let levelDistance = levels[j].distance;
 
-        if (sqrDis >= levelDistance) {
-            levels[i-1].object.visible = false;
-            levels[i].object.visible = true;
-        } else {
-            break;
+            if (sqrDis > levelDistance) {
+                levels[j-1].object.visible = false;
+                levels[j].object.visible = true;
+                if (sqrDis < levelDistance + 5000) {
+                    MAP_CONFIG.tearBlocks[i].visible = true;
+                }
+            } else {
+                break;
+            }
         }
-    }
 
-    obj._currentlevel = i-1;
-    for (; i < numLevels; i++) {
-        levels[i].object.visible = false;
+        for (; j < numLevels; j++) {
+            levels[j].object.visible = false;
+        }
     }
 }
 
@@ -174,6 +182,15 @@ function generateKnots(degree, numPoints) {
     for(let i=0; i<len; i++) knots.push(i / (len - 1));
 
     return knots;
+}
+
+function posToChunk(position) {
+    /*
+        Returns the chunk index for a given position on the map
+    */
+    const xInd = Math.floor((Math.min(Math.max(position.x, 1), MAP_CONFIG.mapDim-2.1)-1) / (MAP_CONFIG.chunkDim-3));
+    const zInd = Math.floor((Math.min(Math.max(position.z, 1), MAP_CONFIG.mapDim-2.1)-1) / (MAP_CONFIG.chunkDim-3));
+    return zInd*MAP_CONFIG.chunkCount + xInd;
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -232,23 +249,20 @@ function generateTerrain(data, knots, noise, pushPoints=true, tearBlock=false) {
 
             // create the parametric suface according to the control points
             const nurbsSurface = new NURBSSurface(MAP_CONFIG.degree, MAP_CONFIG.degree, knots, knots, chunkControlPoints);
-            const lod = new THREE.LOD();
 
             if (tearBlock) {
                 // add the low res terrain under the main terrain to catch tears
-                const culledChunk = new THREE.Object3D();
-                lod.addLevel(culledChunk, 0);
+                const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[MAP_CONFIG.degree], knots[MAP_CONFIG.chunkDim]), 3, 3)
+                const chunk = new THREE.Mesh(geometry, grassMat);
+                MAP_CONFIG.tearBlocks.push(chunk);
 
-                const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[MAP_CONFIG.degree], knots[MAP_CONFIG.chunkDim]), 4, 4)
-
-                // create rings of visible chunks around boundaries and cull the others since they won't be visible
-                for (let i = 1; i < MAP_CONFIG.lod_levels.length; i++) {
-                    const chunk = new THREE.Mesh(geometry, grassMat);
-                    lod.addLevel(chunk, MAP_CONFIG.lod_levels[i][1]);
-                    lod.addLevel(culledChunk, MAP_CONFIG.lod_levels[i][1]+5000);
-                }
-                MAP_CONFIG.tearBlocks.push(lod);
+                // position the chunk
+                chunk.position.set(xOffset, -1.5, zOffset);
+                chunk.updateMatrixWorld(true);
+                terrain.add(chunk);
             } else {
+                const lod = new THREE.LOD();
+
                 // create all the levels of detail
                 for (let i = 0; i < MAP_CONFIG.lod_levels.length; i++) {
                     const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[MAP_CONFIG.degree], knots[MAP_CONFIG.chunkDim]), MAP_CONFIG.lod_levels[i][0], MAP_CONFIG.lod_levels[i][0])
@@ -260,14 +274,14 @@ function generateTerrain(data, knots, noise, pushPoints=true, tearBlock=false) {
                     octree.add(new BVHHelper(chunk));
                 }
                 MAP_CONFIG.chunks.push(lod);
+
+                lod.autoUpdate = false;
+
+                // position the chunk
+                lod.position.set(xOffset, 0, zOffset);
+                lod.updateMatrixWorld(true);
+                terrain.add(lod);
             }
-
-            lod.autoUpdate = false;
-
-            // position the chunk
-            lod.position.set(xOffset, 0, zOffset);
-            lod.updateMatrixWorld(true);
-            terrain.add(lod);
         }
     }
     return terrain;
@@ -296,9 +310,10 @@ const MAP_CONFIG = {
     lod_levels: [[25, 0], [15, 2500], [8, 15000]],
     controlPoints: [],
     chunks: [],
+    chunkDists: [],
     tearBlocks: [],
     treesInstances: [],
-    treeCount: 0,
+    treeData: [],
 }
 
 const grassMat = new THREE.MeshLambertMaterial({color: COLOURS.GRASS_GREEN, side: THREE.BackSide});
@@ -318,7 +333,7 @@ function generateMap(heightmap) {
     */
     map = new THREE.Group();
 
-    // extract the pixel data from the heightmap
+    // extract the pixel data from the heightmap (taken from https://codepen.io/Deniz3457/pen/NWrKZJq)
     const ctx = document.createElement('canvas').getContext('2d');
     const {width: width, height} = heightmap;
     ctx.canvas.width = width;
@@ -329,7 +344,9 @@ function generateMap(heightmap) {
     MAP_CONFIG.mapDim = width;
 
     MAP_CONFIG.controlPoints = [];
+    MAP_CONFIG.treeData = [];
     MAP_CONFIG.chunks = [];
+    MAP_CONFIG.tearBlocks = [];
 
     // round the number of chunks per axis to the nearest factor of the map size-3
     while ((MAP_CONFIG.mapDim-3) % MAP_CONFIG.chunkCount > 0) {
@@ -339,6 +356,8 @@ function generateMap(heightmap) {
 
     // calculate the necessary chunk dimension so the number of points matches the map size
     MAP_CONFIG.chunkDim = ((MAP_CONFIG.mapDim-3)/MAP_CONFIG.chunkCount)+3;
+
+    MAP_CONFIG.chunkDists = new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount);
 
     // generate the b-spline knots
     const knots = generateKnots(MAP_CONFIG.degree, MAP_CONFIG.chunkDim);
@@ -364,8 +383,6 @@ function generateMap(heightmap) {
     map.add(water);
 
     // use raycasts to determine the positions of scenery objects
-    const raycaster = new THREE.Raycaster();
-    raycaster.firstHitOnly = true;
     raycaster.ray.direction.set(0, -1, 0);
 
     // create and place the cathedral
@@ -373,7 +390,7 @@ function generateMap(heightmap) {
     raycaster.ray.origin.set(cathedralChunk.position.x+9, 50, cathedralChunk.position.z+2);
     const hit = raycaster.intersectObject(cathedralChunk.levels[0].object);
 
-    const cathedral = createCathedral(hit[0].point, 1);
+    cathedral = createCathedral(hit[0].point, 1);
     map.add(cathedral);
 
     // create and place bridges
@@ -390,34 +407,35 @@ function generateMap(heightmap) {
     const chunkObjs = new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount).fill().map(() => []);
 
     // create instanced meshes for buildings
-    const buildingMesh = new InstancedMesh2(buildingGeometry, buildingMaterial, { capacity: buildingCount });
-    const roofMesh = new InstancedMesh2(roofGeometry, roofMaterial, { capacity: buildingCount });
+    const buildingMesh = new THREE.InstancedMesh(buildingGeometry, buildingMaterial, buildingCount);
+    const roofMesh = new THREE.InstancedMesh(roofGeometry, roofMaterial, buildingCount);
     const buildingInstances = [buildingMesh, roofMesh];    
 
     map.add(buildingMesh);
     map.add(roofMesh);
-    placeInstanceObjects(buildingInstances, raycaster, chunkObjs, buildingCount, dummy, 0.8, 0.3, 1.5);
+    placeInstanceObjects(buildingInstances, chunkObjs, buildingCount, 0.8, 0.3, 1.5);
 
-    // create instanced meshes for the trees
-    const trunkMesh = new InstancedMesh2(trunkGeometryHigh, trunkMaterial, { capacity: treeCount });
-    const leavesMesh = new InstancedMesh2(leavesGeometryHigh, leavesMaterial, { capacity: treeCount });
+    // create instanced meshes for the trees and its imposters
+    const trunkMesh = new THREE.InstancedMesh(trunkGeometry, trunkMaterial, treeCount);
+    const leavesMesh = new THREE.InstancedMesh(leavesGeometry, leavesMaterial, treeCount);
+    const trunkMeshImposter = new THREE.InstancedMesh(trunkGeometryImposter, trunkMaterial, treeCount);
+    const leavesMeshImposter = new THREE.InstancedMesh(leavesGeometryImposter, leavesMaterial, treeCount);
 
-    trunkMesh.addLOD(trunkGeometryLow, trunkMaterial, 50)
-    trunkMesh.addLOD(trunkGeometryImposter, trunkMaterial, 120)
-    leavesMesh.addLOD(leavesGeometryLow, leavesMaterial, 70)
-    leavesMesh.addLOD(leavesGeometryImposter, leavesMaterial, 120)
-
-    MAP_CONFIG.treesInstances = [trunkMesh, leavesMesh];
+    MAP_CONFIG.treesInstances = [trunkMesh, leavesMesh, trunkMeshImposter, leavesMeshImposter];
 
     map.add(trunkMesh);
     map.add(leavesMesh);
-    MAP_CONFIG.treeCount = placeInstanceObjects(MAP_CONFIG.treesInstances, raycaster, chunkObjs, treeCount, dummy, 0.2, 0.25, 2.5);
+    map.add(trunkMeshImposter);
+    map.add(leavesMeshImposter);
+    placeInstanceObjects(MAP_CONFIG.treesInstances, chunkObjs, treeCount, 0.2, 0.25, 2.5, true);
+
+    // create the agents for the boids
+    createAgents();
+    map.add(AGENTS_CONFIG.agentInstance);
 
     // visualise the control points for debugging
-    controlPointsMesh = new InstancedMesh2(new THREE.SphereGeometry(0.4, 3, 2), new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_RED}), {capacity: MAP_CONFIG.controlPoints.length});
+    controlPointsMesh = new THREE.InstancedMesh(new THREE.SphereGeometry(0.4, 3, 2), new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_RED}), MAP_CONFIG.controlPoints.length);
     controlPointsMesh.visible = STATE.show_points;
-
-    controlPointsMesh.addInstances(MAP_CONFIG.controlPoints.length);
 
     // set the positions for each control point
     let ind = 0
@@ -454,29 +472,26 @@ function generateMap(heightmap) {
     });
 
     scene.add(map);
+    mapLoaded = true;
 }
 
 ////////////////////////////////////////////////////////////////////////////
 // SCENARY
 ////////////////////////////////////////////////////////////////////////////
 
-const chunkIgnore = [87, 88, 103, 104, 119, 120]
+const cathedralChunks = [87, 88, 103, 104, 119, 120]
 
 // create the tree components
-const trunkGeometryHigh = new THREE.CylinderGeometry(0.3, 0.5, 2, 6);
-const trunkGeometryLow = new THREE.BoxGeometry(0.7, 2, 0.7);
+const trunkGeometry = new THREE.CylinderGeometry(0.3, 0.5, 2, 3);
 const trunkGeometryImposter = new THREE.PlaneGeometry(0.7, 2);
 const trunkMaterial = new THREE.MeshLambertMaterial({color: COLOURS.TREE_BROWN});
-trunkGeometryHigh.translate(0, 1.0, 0); 
-trunkGeometryLow.translate(0, 1.0, 0); 
+trunkGeometry.translate(0, 1.0, 0); 
 trunkGeometryImposter.translate(0, 1.0, 0); 
 
-const leavesGeometryHigh = new THREE.ConeGeometry(2, 4, 6);
-const leavesGeometryLow = new THREE.ConeGeometry(2, 4, 4);
+const leavesGeometry = new THREE.ConeGeometry(2, 4, 5);
 const leavesGeometryImposter = new THREE.ConeGeometry(2, 4, 2); // this creates a single triangle
 const leavesMaterial = new THREE.MeshLambertMaterial({color: COLOURS.LEAF_GREEN});
-leavesGeometryHigh.translate(0, 4.0, 0);
-leavesGeometryLow.translate(0, 4.0, 0);
+leavesGeometry.translate(0, 4.0, 0);
 leavesGeometryImposter.translate(0, 4.0, 0);
 
 const treeCount = 4000;
@@ -502,11 +517,13 @@ towerGeometry.computeBoundsTree();
 const towerRoofGeometry = new THREE.ConeGeometry(3.5, 1, 4);
 const towerRoofMaterial = new THREE.MeshLambertMaterial({color: COLOURS.ROOF_GREY});
 
+let cathedral;
+
 const bridgeGeometry = new THREE.BoxGeometry(25, 2, 3);
 
 bridgeGeometry.computeBoundsTree();
 
-function placeInstanceObjects(instances, raycaster, chunkObjs, count, dummy, scale, scaleVariation, minDist) {
+function placeInstanceObjects(instances, chunkObjs, count, scale, scaleVariation, minDist, trees=false) {
     /*
         Places objects from mesh instances onto the map
         A raycaster is used to determine position
@@ -516,7 +533,7 @@ function placeInstanceObjects(instances, raycaster, chunkObjs, count, dummy, sca
         // randomly choose a chunk to spawn the object into
         const chunkInd = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
 
-        if (chunkIgnore.includes(chunkInd)) continue;
+        if (cathedralChunks.includes(chunkInd)) continue;
 
         const chunk = MAP_CONFIG.chunks[chunkInd];
 
@@ -549,14 +566,18 @@ function placeInstanceObjects(instances, raycaster, chunkObjs, count, dummy, sca
 
             if (intersects) continue;
 
-            instances.forEach(instance => instance.addInstances(1));
-
             // set the transform of the object
             dummy.position.copy(position);
-            dummy.rotation.y = Math.random() * Math.PI;
-            dummy.scale.setScalar(scale + Math.random()*scaleVariation);
+
+            const objScale = scale + Math.random()*scaleVariation;
+            dummy.scale.setScalar(objScale);
 
             chunkObjs[chunkInd].push([position.x, position.z]);
+
+            // save tree data for imposter checks
+            if (trees) {
+                MAP_CONFIG.treeData.push([chunkInd, position, objScale])
+            }
             
             dummy.updateMatrix();
             instances.forEach(instance => instance.setMatrixAt(hits, dummy.matrix));
@@ -565,39 +586,63 @@ function placeInstanceObjects(instances, raycaster, chunkObjs, count, dummy, sca
         }
     }
 
-    return hits
+    instances.forEach(instance => instance.count = hits);
 }
 
+const camDir = new THREE.Vector3();
 function checkImposter() {
     /*
-        Checks each tree and makes it rotate to face the camera if it's an imposter
+        Checks each tree if it needs to be swapped with an imposter
     */
-    for (let i = 0; i < MAP_CONFIG.treeCount; i++) {
+    tempVec.copy(camera.position);
+    map.worldToLocal(tempVec);
 
-        // get the corresponding tree's components
-        MAP_CONFIG.treesInstances[0].getMatrixAt(i, dummy.matrix);
-        dummy.matrix.decompose(dummy.position, dummy.quaternion, dummy.scale);
+    camera.getWorldDirection(camDir);
 
-        // convert the camera's position into the trees' local space position
-        tempVec.copy(camWorldPos);
-        MAP_CONFIG.treesInstances[0].worldToLocal(tempVec);
+    let treeInd = 0;
+    let imposterInd = 0;
+    for (let i = 0; i < MAP_CONFIG.treeData.length; i++) {
 
-        if (tempVec.distanceTo(dummy.position) > 119) {
+        const data = MAP_CONFIG.treeData[i];
+        dummy.position.copy(data[1]);
+        dummy.scale.setScalar(data[2]);
+
+        tempVec2.subVectors(data[1], tempVec).normalize();
+
+        if (MAP_CONFIG.chunkDists[data[0]] > 32000 && camDir.dot(tempVec2) > 0.7) {
+            // convert the camera's position into the trees' local space position
+            tempVec.y = dummy.position.y;
 
             // make the imposter face the camera
-            tempVec.y = dummy.position.y;
             dummy.lookAt(tempVec);
             dummy.updateMatrix();
 
-            MAP_CONFIG.treesInstances[0].setMatrixAt(i, dummy.matrix)
+            MAP_CONFIG.treesInstances[2].setMatrixAt(imposterInd, dummy.matrix)
 
             // the leaves are a single triangle that needs to be rotated by 90 degrees
             dummy.rotateY(Math.PI/2);
             dummy.updateMatrix();
 
-            MAP_CONFIG.treesInstances[1].setMatrixAt(i, dummy.matrix)
+            MAP_CONFIG.treesInstances[3].setMatrixAt(imposterInd, dummy.matrix)
+
+            imposterInd++;
+
+        } else {
+            dummy.rotation.set(0, 0, 0);
+            dummy.updateMatrix();
+
+            MAP_CONFIG.treesInstances[0].setMatrixAt(treeInd, dummy.matrix)
+            MAP_CONFIG.treesInstances[1].setMatrixAt(treeInd, dummy.matrix)
+            treeInd++;
         }
     }
+
+    MAP_CONFIG.treesInstances[0].count = treeInd;
+    MAP_CONFIG.treesInstances[1].count = treeInd;
+    MAP_CONFIG.treesInstances[2].count = imposterInd;
+    MAP_CONFIG.treesInstances[3].count = imposterInd;
+
+    MAP_CONFIG.treesInstances.forEach(instance => instance.instanceMatrix.needsUpdate = true);
 }
 
 function createBridge(position, rotY, rotZ) {
@@ -665,6 +710,230 @@ function createCathedral(position, scale) {
 }
 
 ////////////////////////////////////////////////////////////////////////////
+// AGENTS
+////////////////////////////////////////////////////////////////////////////
+
+const AGENTS_CONFIG = {
+    count: 1200,
+    flocks: 6,
+    speed: 0.1,
+    neighbourDist: 5,
+    weights: [0.015, 0.02, 0.07, 0.3, 1],
+    maxForce: 0.5,
+    lookahead: 20,
+    agentInstance: NaN,
+    velocities: [],
+    positions: [],
+    agentsInChunk: new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount).fill().map(() => []),
+    agentToChunk: [],
+    agentQuadrants: [],
+    targetChunks: [],
+    targetPos: [],
+}
+
+const agentGeometry = new THREE.BoxGeometry(0.5, 0.5, 0.5);
+const agentMaterial = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_RED});
+
+function createAgents() {
+    /*
+        creates the agents for the boids
+    */
+    AGENTS_CONFIG.agentInstance = new THREE.InstancedMesh(agentGeometry, agentMaterial, AGENTS_CONFIG.count);
+    AGENTS_CONFIG.velocities = [];
+    AGENTS_CONFIG.positions = [];
+
+    AGENTS_CONFIG.agentsInChunk = new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount).fill().map(() => []);
+    AGENTS_CONFIG.agentToChunk = [];
+    AGENTS_CONFIG.agentQuadrants = [];
+
+    AGENTS_CONFIG.targetChunks = [];
+    AGENTS_CONFIG.targetPos = [];
+
+    // have the bounding sphere cover the whole map so they are never unloaded
+    AGENTS_CONFIG.agentInstance.geometry.boundingSphere = new THREE.Sphere(new THREE.Vector3(MAP_CONFIG.mapDim/2, 0, MAP_CONFIG.mapDim/2), MAP_CONFIG.mapDim*2);
+
+    for (let i = 0; i < AGENTS_CONFIG.count; i++) {
+        const chunkInd = 136;
+        const chunk = MAP_CONFIG.chunks[chunkInd];
+
+        // choose a random position from within the chunk
+        const x = Math.random() * (MAP_CONFIG.chunkDim-3) * 0.8 + 1.5 + chunk.position.x;
+        const z = Math.random() * (MAP_CONFIG.chunkDim-3) * 0.8 + 1.5 + chunk.position.z;
+
+        // set the transform of the object
+        dummy.position.set(x, 12+Math.random()*4, z);
+        dummy.rotation.y = Math.random() * Math.PI;
+        dummy.scale.setScalar(1);
+        
+        dummy.updateMatrix();
+
+        AGENTS_CONFIG.agentInstance.setMatrixAt(i, dummy.matrix);
+        AGENTS_CONFIG.agentsInChunk[chunkInd].push(i);
+        AGENTS_CONFIG.agentToChunk.push(chunkInd);
+        AGENTS_CONFIG.agentQuadrants.push(0);
+
+        AGENTS_CONFIG.velocities.push(new THREE.Vector3(Math.random(), Math.random(), Math.random()));
+        AGENTS_CONFIG.positions.push(new THREE.Vector3().copy(dummy.position));
+    }
+
+    // create random targets for the agents based on flock
+    const offset = (MAP_CONFIG.chunkDim-3) / 2;
+    for (let i = 0; i < AGENTS_CONFIG.flocks; i++) {
+        AGENTS_CONFIG.targetChunks.push(Math.floor(Math.random() * MAP_CONFIG.chunks.length));
+        AGENTS_CONFIG.targetPos.push(new THREE.Vector3().set(MAP_CONFIG.chunks[AGENTS_CONFIG.targetChunks[i]].position.x + offset, 12, MAP_CONFIG.chunks[AGENTS_CONFIG.targetChunks[i]].position.z + offset));
+    }
+}
+
+const force = new THREE.Vector3();
+const diff = new THREE.Vector3();
+const separation = new THREE.Vector3();
+const alignment = new THREE.Vector3();
+const cohesion = new THREE.Vector3();
+const target = new THREE.Vector3();
+const avoid = new THREE.Vector3();
+
+function updateAgents() {
+    /*
+        updates the velocities and positions of each agent according to the boids laws
+    */
+    for (let i = 0; i < AGENTS_CONFIG.count; i++) {
+        tempVec.copy(AGENTS_CONFIG.positions[i]);
+
+        const currentVelocity = AGENTS_CONFIG.velocities[i];
+        const agentChunk = AGENTS_CONFIG.agentToChunk[i];
+
+        // consider each other agent in the same chunk
+        let neighbours = 0;
+        for (const other of AGENTS_CONFIG.agentsInChunk[agentChunk]) {
+            // only consider agents that are also in the same quadrant
+            if (AGENTS_CONFIG.agentQuadrants[other] != AGENTS_CONFIG.agentQuadrants[i]) continue;
+            if (i == other) continue;
+            tempVec2.copy(AGENTS_CONFIG.positions[other]);
+
+            const sqrDis = tempVec.distanceToSquared(tempVec2);
+
+            // apply the rules considering the nearby agents
+            if (sqrDis < AGENTS_CONFIG.neighbourDist) {
+                separation.add(diff.subVectors(tempVec, tempVec2).divideScalar(sqrDis));
+                alignment.add(AGENTS_CONFIG.velocities[other]);
+                cohesion.add(tempVec2);
+
+                neighbours++;
+            }
+        }
+
+        // apply the individual forces on the main steering force
+        if (neighbours > 0) {
+            alignment.normalize().multiplyScalar(AGENTS_CONFIG.speed).sub(currentVelocity);
+            cohesion.divideScalar(neighbours).sub(tempVec).normalize().multiplyScalar(AGENTS_CONFIG.speed).sub(currentVelocity);
+
+            force.addScaledVector(separation, AGENTS_CONFIG.weights[0]);
+            force.addScaledVector(alignment, AGENTS_CONFIG.weights[1]);
+            force.addScaledVector(cohesion, AGENTS_CONFIG.weights[2]);
+        }
+
+        // find what target this agent has and apply its force
+        const flock = Math.floor(i / (AGENTS_CONFIG.count/AGENTS_CONFIG.flocks));
+        target.subVectors(AGENTS_CONFIG.targetPos[flock], tempVec).sub(currentVelocity).normalize();
+        force.addScaledVector(target, AGENTS_CONFIG.weights[3]);
+
+        // set up the raycast
+        const velocityNormalised = currentVelocity.normalize();
+        raycaster.ray.direction.copy(velocityNormalised);
+        raycaster.ray.origin.copy(tempVec.clone().applyMatrix4(map.matrixWorld));
+
+        let hit;
+
+        // only check for ground intersection if the agent is close to the ground
+        if (tempVec.y < 12) {
+            hit = raycaster.intersectObject(MAP_CONFIG.chunks[agentChunk].levels[2].object);
+            if (hit.length > 0) {
+                avoid.copy(hit[0].face.normal);
+            } else {
+                const rayChunk = posToChunk(tempVec.clone().addScaledVector(velocityNormalised, AGENTS_CONFIG.lookahead));
+                if (rayChunk != agentChunk) {
+                    hit = raycaster.intersectObject(MAP_CONFIG.chunks[rayChunk].levels[2].object);
+                    if (hit.length > 0) {
+                        avoid.copy(hit[0].face.normal);
+                    }
+                }
+            }
+        }
+
+        // check for relevant cathedral intersections if the agent is in the cathedral chunks
+        if (agentChunk == 87 || agentChunk == 88) {
+            hit = raycaster.intersectObject(cathedral.children[2]);
+            if (hit.length > 0) {
+                avoid.sub(hit[0].face.normal);
+            }
+        } else if (agentChunk == 103 || agentChunk == 104) {
+            const obstacles = [cathedral.children[0], cathedral.children[1], cathedral.children[2], cathedral.children[6]]
+            hit = raycaster.intersectObjects(obstacles);
+            if (hit.length > 0) {
+                avoid.sub(hit[0].face.normal);
+            }
+        } else if (agentChunk == 119 || agentChunk == 120) {
+            const obstacles = [cathedral.children[0], cathedral.children[1], cathedral.children[6]]
+            hit = raycaster.intersectObjects(obstacles);
+            if (hit.length > 0) {
+                avoid.sub(hit[0].face.normal);
+            }
+        }
+
+        force.addScaledVector(avoid, -AGENTS_CONFIG.weights[4]);
+
+        // clamp the force and update the velocity
+        force.clampLength(0, AGENTS_CONFIG.maxForce);
+        currentVelocity.add(force).clampLength(0, AGENTS_CONFIG.speed);
+
+        // reset the forces
+        force.set(0, 0, 0);
+        separation.set(0, 0, 0);
+        alignment.set(0, 0, 0);
+        cohesion.set(0, 0, 0);
+        target.set(0, 0, 0);
+        avoid.set(0, 0, 0);
+
+        // update the position and find which new chunk the agent is in
+        AGENTS_CONFIG.positions[i].add(currentVelocity);
+        const newChunkInd = posToChunk(AGENTS_CONFIG.positions[i]);
+        if (newChunkInd != agentChunk) {
+            AGENTS_CONFIG.agentToChunk[i] = newChunkInd;
+            AGENTS_CONFIG.agentsInChunk[agentChunk].splice(AGENTS_CONFIG.agentsInChunk[agentChunk].indexOf(i), 1);
+            AGENTS_CONFIG.agentsInChunk[newChunkInd].push(i);
+        }
+
+        // find which quadrant the agent is in
+        const xQuad = Math.floor(((AGENTS_CONFIG.positions[i].x - MAP_CONFIG.chunks[newChunkInd].position.x))/((MAP_CONFIG.chunkDim-3)/2));
+        const zQuad = Math.floor(((AGENTS_CONFIG.positions[i].z - MAP_CONFIG.chunks[newChunkInd].position.z))/((MAP_CONFIG.chunkDim-3)/2));
+        AGENTS_CONFIG.agentQuadrants[i] = zQuad * 2 + xQuad;
+
+        dummy.position.copy(AGENTS_CONFIG.positions[i]);        
+        dummy.updateMatrix();
+
+        AGENTS_CONFIG.agentInstance.setMatrixAt(i, dummy.matrix);
+    }
+
+    AGENTS_CONFIG.agentInstance.instanceMatrix.needsUpdate = true;
+}
+
+function targetCheck() {
+    /*
+        check if enough agents have reached the target and find a new target if they have
+    */
+    const offset = (MAP_CONFIG.chunkDim-3) / 2;
+    for (let i = 0; i < AGENTS_CONFIG.flocks; i++) {
+        if (AGENTS_CONFIG.agentsInChunk[AGENTS_CONFIG.targetChunks[i]].length > 150) {
+            AGENTS_CONFIG.targetChunks[i] = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
+            while (cathedralChunks.includes(AGENTS_CONFIG.targetChunks[i])) {
+                AGENTS_CONFIG.targetChunks[i] = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
+            }
+            AGENTS_CONFIG.targetPos[i].set(MAP_CONFIG.chunks[AGENTS_CONFIG.targetChunks[i]].position.x + offset, 12, MAP_CONFIG.chunks[AGENTS_CONFIG.targetChunks[i]].position.z + offset);
+        }
+    }
+}
+
+////////////////////////////////////////////////////////////////////////////
 // EFFECTS & LIGHTING
 ////////////////////////////////////////////////////////////////////////////
 
@@ -676,7 +945,7 @@ function addBaseLight() {
 }
 
 scene.background = new THREE.Color(COLOURS.SKY_BLUE);
-scene.fog = new THREE.FogExp2(0x87CEEB, 0.005); 
+scene.fog = new THREE.FogExp2(0x87CEEB, 0.007); 
 
 ////////////////////////////////////////////////////////////////////////////
 // MAIN
@@ -697,15 +966,17 @@ function animate() {
 
     orbitControls.update();
 
-    // only update lods every 20 frames
-    if (frame % 20 == 0) {
-        MAP_CONFIG.chunks.forEach(chunk => updateLOD(chunk));
-        MAP_CONFIG.tearBlocks.forEach(tearBlock => updateLOD(tearBlock));        
+    if (mapLoaded) {
+        // only update lods every 20 frames
+        if (frame % 20 == 0 && mapLoaded) {
+            updateChunks();    
+            checkImposter();
+            targetCheck();         
+            frame = 0;
+        }
 
-        checkImposter();
-        
-        frame = 0;
-    }
+        updateAgents();
+    } 
     frame++;
 
     renderer.render(scene, camera);
