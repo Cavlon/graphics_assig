@@ -4,7 +4,12 @@ import {NURBSSurface} from 'three/addons/curves/NURBSSurface.js';
 import {ParametricGeometry} from 'three/addons/geometries/ParametricGeometry.js';
 import {SimplexNoise} from 'three/addons/math/SimplexNoise.js';
 import Stats from 'three/addons/libs/stats.module.js';
-import {computeBoundsTree, disposeBoundsTree, acceleratedRaycast, BVHHelper} from 'three-mesh-bvh';
+import {EffectComposer} from 'three/addons/postprocessing/EffectComposer.js';
+import {RenderPass} from 'three/addons/postprocessing/RenderPass.js';
+import {OutputPass} from 'three/addons/postprocessing/OutputPass.js';
+import {UnrealBloomPass} from 'three/addons/postprocessing/UnrealBloomPass.js';
+import {ShaderPass} from 'three/addons/postprocessing/ShaderPass.js';
+import {FXAAShader} from 'three/addons/shaders/FXAAShader.js';
 
 ////////////////////////////////////////////////////////////////////////////
 // SETUP
@@ -19,10 +24,6 @@ let stats = new Stats();
 stats.showPanel(0);
 document.body.appendChild(stats.dom);
 
-THREE.BufferGeometry.prototype.computeBoundsTree = computeBoundsTree;
-THREE.BufferGeometry.prototype.disposeBoundsTree = disposeBoundsTree;
-THREE.Mesh.prototype.raycast = acceleratedRaycast;
-
 const upVec = new THREE.Vector3(0, 1, 0);
 let mapLoaded = false;
 
@@ -31,6 +32,8 @@ const COLOURS = {
     DEBUG_RED: 0xff0000,
     DEBUG_ORANGE: 0xf2ad0d,
     DEBUG_YELLOW: 0xe4eb70,
+    SUN_YELLOW: 0xfffae6,
+    MOON_BLUE: 0x4444ff,
     TREE_BROWN: 0x8D6E63,
     LEAF_GREEN: 0x7CB342,
     GRASS_GREEN: 0x6ba659,
@@ -43,13 +46,14 @@ const COLOURS = {
     PROPELLER_GREY: 0x78909C,
     WATER_BLUE: 0x5998a6,
     SKY_BLUE: 0x87ceeb,
+    NIGHT_BLUE: 0x546E7A,
 }
 
 const STATE = {
     show_wireframe: false,
     show_points: false,
     show_chunks: false,
-    show_bvh: false,
+    night: false,
 }
 
 ////////////////////////////////////////////////////////////////////////////
@@ -79,8 +83,8 @@ window.addEventListener('keydown', (event) => {
             STATE.show_chunks = !STATE.show_chunks;
 
             for (let i = 0; i < MAP_CONFIG.chunks.length; i++) {
-                let orangeMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_ORANGE, side: THREE.BackSide, wireframe: STATE.show_wireframe});
-                let yellowMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_YELLOW, side: THREE.BackSide, wireframe: STATE.show_wireframe});
+                let orangeMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_ORANGE, side: THREE.FrontSide, wireframe: STATE.show_wireframe});
+                let yellowMat = new THREE.MeshLambertMaterial({color: COLOURS.DEBUG_YELLOW, side: THREE.FrontSide, wireframe: STATE.show_wireframe});
 
                 orangeMat.color.set(COLOURS.DEBUG_ORANGE);
                 yellowMat.color.set(COLOURS.DEBUG_YELLOW);
@@ -110,17 +114,15 @@ window.addEventListener('keydown', (event) => {
             mapLoaded = false;
             init();
             break;
-        case 'b':
-            STATE.show_bvh = !STATE.show_bvh;
-            bvhBounds.visible = STATE.show_bvh;
+        case 'n':
+            STATE.night = !STATE.night;
+            setTime();
             break;
     }
 })
 
 camera.position.set(0, 20, 50);
 camera.lookAt(scene.position);
-
-let bvhBounds;
 
 ////////////////////////////////////////////////////////////////////////////
 // UTILITY
@@ -132,43 +134,24 @@ const dummy = new THREE.Object3D();
 const raycaster = new THREE.Raycaster();
 raycaster.firstHitOnly = true;
 
-function updateChunks() {
+function setTime() {
     /*
-        Updates the lods of each chunk and sets tear block visibility
+        Changes scene parameters for night and daytime
     */
-    for (let i = 0; i < MAP_CONFIG.chunks.length; i++) {
-        const chunk = MAP_CONFIG.chunks[i];
-        MAP_CONFIG.tearBlocks[i].visible = false;
-
-        const levels = chunk.levels;
-        const numLevels = levels.length;
-
-        chunk.getWorldPosition(tempVec);
-        const sqrDis = tempVec.distanceToSquared(camera.position);
-
-        MAP_CONFIG.chunkDists[i] = sqrDis;
-
-        levels[0].object.visible = true;
-
-        let j = 1;
-        for (; j < numLevels; j++) {
-
-            let levelDistance = levels[j].distance;
-
-            if (sqrDis > levelDistance) {
-                levels[j-1].object.visible = false;
-                levels[j].object.visible = true;
-                if (sqrDis < levelDistance + 5000) {
-                    MAP_CONFIG.tearBlocks[i].visible = true;
-                }
-            } else {
-                break;
-            }
-        }
-
-        for (; j < numLevels; j++) {
-            levels[j].object.visible = false;
-        }
+    if (STATE.night) {
+        skyLight.intensity = 0.2;
+        skyLight.color.setHex(COLOURS.MOON_BLUE);
+        scene.background = new THREE.Color(COLOURS.NIGHT_BLUE);
+        bloomPass.enabled = true;
+        agentMaterial.emissiveIntensity = 0.8;
+        spotlights.forEach(spotlight => spotlight.visible = true);
+    } else {
+        skyLight.intensity = 3;
+        skyLight.color.setHex(COLOURS.SUN_YELLOW);
+        scene.background = new THREE.Color(COLOURS.SKY_BLUE);
+        bloomPass.enabled = false;
+        agentMaterial.emissiveIntensity = 0;
+        spotlights.forEach(spotlight => spotlight.visible = false);
     }
 }
 
@@ -234,7 +217,7 @@ function generateChunkControlPoints(heightData, globalXOffset, globalZOffset, we
     return chunkControlPoints;
 }
 
-function generateTerrain(data, knots, noise, destinationHolder, pushPoints=true, tearBlockResolution=0, computeBounds=false) {
+function generateTerrain(data, knots, noise, destinationHolder, pushPoints=true, tearBlockResolution=0) {
     /*
         Generates the terrain mesh as a series of parametric b-spline surfaces from a heightmap
     */
@@ -260,10 +243,6 @@ function generateTerrain(data, knots, noise, destinationHolder, pushPoints=true,
 
                 // position the chunk
                 chunk.position.set(xOffset, -1.5, zOffset);
-                if (computeBounds) {
-                    geometry.computeBoundsTree();
-                    bvhBounds.add(new BVHHelper(chunk));
-                }
                 chunk.updateMatrixWorld(true);
                 terrain.add(chunk);
             } else {
@@ -274,12 +253,6 @@ function generateTerrain(data, knots, noise, destinationHolder, pushPoints=true,
                     const geometry = new ParametricGeometry((u, v, target) => mapInternalSurface(u, v, target, nurbsSurface, knots[MAP_CONFIG.degree], knots[MAP_CONFIG.chunkDim]), MAP_CONFIG.lod_levels[i][0], MAP_CONFIG.lod_levels[i][0])
                     const chunk = new THREE.Mesh(geometry, grassMat);
                     lod.addLevel(chunk, MAP_CONFIG.lod_levels[i][1]);
-
-                    // compute the bound volume tree for efficient raycasting
-                    if (computeBounds) {
-                        geometry.computeBoundsTree();
-                        bvhBounds.add(new BVHHelper(chunk));
-                    }
                 }
                 if (destinationHolder != NaN) destinationHolder.push(lod);
 
@@ -295,12 +268,52 @@ function generateTerrain(data, knots, noise, destinationHolder, pushPoints=true,
     return terrain;
 }
 
+function updateChunks() {
+    /*
+        Updates the lods of each chunk and sets tear block visibility
+    */
+    for (let i = 0; i < MAP_CONFIG.chunks.length; i++) {
+        const chunk = MAP_CONFIG.chunks[i];
+        MAP_CONFIG.tearBlocks[i].visible = false;
+
+        const levels = chunk.levels;
+        const numLevels = levels.length;
+
+        chunk.getWorldPosition(tempVec);
+        const sqrDis = tempVec.distanceToSquared(camera.position);
+
+        MAP_CONFIG.chunkDists[i] = sqrDis;
+
+        levels[0].object.visible = true;
+
+        let j = 1;
+        for (; j < numLevels; j++) {
+
+            let levelDistance = levels[j].distance;
+
+            if (sqrDis > levelDistance) {
+                levels[j-1].object.visible = false;
+                levels[j].object.visible = true;
+                if (sqrDis < levelDistance + 5000) {
+                    MAP_CONFIG.tearBlocks[i].visible = true;
+                }
+            } else {
+                break;
+            }
+        }
+
+        for (; j < numLevels; j++) {
+            levels[j].object.visible = false;
+        }
+    }
+}
+
 function mapInternalSurface(u, v, target, surface, startT, endT) {
     /*
         Only render the surface for the internal control points
     */
     const range = endT - startT;
-    const newU = startT + (u * range);
+    const newU = startT + ((1-u) * range);
     const newV = startT + (v * range);
 
     surface.getPoint(newU, newV, target);
@@ -325,7 +338,7 @@ const MAP_CONFIG = {
     treeData: [],
 }
 
-const grassMat = new THREE.MeshLambertMaterial({color: COLOURS.GRASS_GREEN, side: THREE.BackSide});
+const grassMat = new THREE.MeshLambertMaterial({color: COLOURS.GRASS_GREEN, side: THREE.FrontSide});
 let controlPointsMesh;
 
 let map;
@@ -375,7 +388,7 @@ function generateMap(heightmap) {
     const noise = new SimplexNoise();
 
     // generate the terrain mesh
-    const terrain = generateTerrain(data, knots, noise, MAP_CONFIG.chunks);
+    const terrain = generateTerrain(data, knots, noise, MAP_CONFIG.chunks, true, 0);
     map.add(terrain);
 
     // the lods cause tearing so a low resolution version of the terrain is added underneath to visually hide tears
@@ -384,7 +397,7 @@ function generateMap(heightmap) {
     map.add(tearBlock);
 
     // create a low-res copy of the terrain above it for agent collision
-    const chunkCollision = generateTerrain(data, knots, noise, MAP_CONFIG.chunkColliders, false, 1, true);
+    const chunkCollision = generateTerrain(data, knots, noise, MAP_CONFIG.chunkColliders, false, 1);
     chunkCollision.position.y = 5;
     chunkCollision.visible = false;
     map.add(chunkCollision);
@@ -420,6 +433,27 @@ function generateMap(heightmap) {
         [cathedral.children[0], cathedral.children[1], cathedral.children[6]]
     ]
     map.add(cathedral);
+
+    // add the spotlights coming from the cathedral
+    spotlights = [];
+
+    const spotlight1 = addSpotlight();
+    const spotlight2 = addSpotlight();
+
+    spotlight1.position.set(cathedral.position.x+3, cathedral.position.y+9, cathedral.position.z);
+    spotlight2.position.set(cathedral.position.x-3, cathedral.position.y+9, cathedral.position.z);
+
+    spotlight1.rotation.set(-Math.PI/2.4, Math.PI/4, 0, 'YXZ');
+    spotlight2.rotation.set(-Math.PI/2.4, -Math.PI/4, 0, 'YXZ');
+
+    spotlights.push(spotlight1);
+    spotlights.push(spotlight2);
+
+    spotlight1.visible = STATE.night;
+    spotlight2.visible = STATE.night;
+
+    map.add(spotlight1);
+    map.add(spotlight2);
 
     // create and place bridges
     const bridge1Chunk = MAP_CONFIG.chunks[85];
@@ -540,16 +574,12 @@ const buildingCount = 1000;
 const towerGeometry = new THREE.BoxGeometry(4, 9, 4);
 const towerMaterial = new THREE.MeshLambertMaterial({color: COLOURS.BUILDING_BEIGE});
 
-towerGeometry.computeBoundsTree();
-
 const towerRoofGeometry = new THREE.ConeGeometry(3.5, 1, 4);
 const towerRoofMaterial = new THREE.MeshLambertMaterial({color: COLOURS.ROOF_GREY});
 
 let cathedral;
 
 const bridgeGeometry = new THREE.BoxGeometry(25, 2, 3);
-
-bridgeGeometry.computeBoundsTree();
 
 function placeInstanceObjects(instances, chunkObjs, count, scale, scaleVariation, minDist, trees=false) {
     /*
@@ -577,7 +607,7 @@ function placeInstanceObjects(instances, chunkObjs, count, scale, scaleVariation
             const normal = hit[0].face.normal;
 
             // only place an object if the area is flat and above the river
-            if (normal.dot(upVec) > -0.95 || hit[0].point.y < 2) continue;
+            if (normal.dot(upVec) < 0.95 || hit[0].point.y < 2) continue;
 
             const position = hit[0].point
 
@@ -596,6 +626,7 @@ function placeInstanceObjects(instances, chunkObjs, count, scale, scaleVariation
 
             // set the transform of the object
             dummy.position.copy(position);
+            dummy.rotation.set(0, Math.random() * Math.PI * 2, 0);
 
             const objScale = scale + Math.random()*scaleVariation;
             dummy.scale.setScalar(objScale);
@@ -677,8 +708,6 @@ function createBridge(position, rotY, rotZ) {
     bridgeMesh.position.set(position.x, position.y, position.z);
     bridgeMesh.quaternion.setFromEuler(new THREE.Euler(0, rotY, rotZ));
 
-    bvhBounds.add(new BVHHelper(bridgeMesh));
-
     return bridgeMesh
 }
 
@@ -731,8 +760,6 @@ function createCathedral(position, scale) {
     cathedral.position.set(position.x, position.y-0.5, position.z);
     cathedral.scale.setScalar(scale);
     
-    cathedral.children.forEach(mesh => bvhBounds.add(new BVHHelper(mesh)))
-    
     return cathedral
 }
 
@@ -741,11 +768,11 @@ function createCathedral(position, scale) {
 ////////////////////////////////////////////////////////////////////////////
 
 const AGENTS_CONFIG = {
-    count: 1200,
-    flocks: 6,
+    flockSize: 200,
+    flocks: 8,
     speed: 0.1,
     neighbourDist: 5,
-    weights: [0.01, 0.02, 0.07, 0.2, 0.6],
+    weights: [0.01, 0.02, 0.07, 0.15, 0.6],
     maxForce: 0.075,
     lookahead: 3,
     agentInstance: NaN,
@@ -766,14 +793,17 @@ const agentPropellerMaterial = new THREE.MeshLambertMaterial({color: COLOURS.PRO
 agentPropeller1Geometry.translate(0.25, 0, 0);
 agentPropeller2Geometry.translate(-0.25, 0, 0);
 
+agentMaterial.emissive.setRGB(4, 1, 2);
+
 function createAgents() {
     /*
         creates the agents for the boids
     */
+    const count = AGENTS_CONFIG.flockSize*AGENTS_CONFIG.flocks;
     AGENTS_CONFIG.agentInstance = [
-        new THREE.InstancedMesh(agentGeometry, agentMaterial, AGENTS_CONFIG.count),
-        new THREE.InstancedMesh(agentPropeller1Geometry, agentPropellerMaterial, AGENTS_CONFIG.count),
-        new THREE.InstancedMesh(agentPropeller2Geometry, agentPropellerMaterial, AGENTS_CONFIG.count),
+        new THREE.InstancedMesh(agentGeometry, agentMaterial, count),
+        new THREE.InstancedMesh(agentPropeller1Geometry, agentPropellerMaterial, count),
+        new THREE.InstancedMesh(agentPropeller2Geometry, agentPropellerMaterial, count),
     ]
     AGENTS_CONFIG.velocities = [];
     AGENTS_CONFIG.agentTransforms = [];
@@ -788,34 +818,44 @@ function createAgents() {
     // dont' cull the agents
     AGENTS_CONFIG.agentInstance.forEach(instance => instance.frustumCulled = false);
 
-    for (let i = 0; i < AGENTS_CONFIG.count; i++) {
-        const chunkInd = 136;
+    let i = 0;
+    for (let j = 0; j < AGENTS_CONFIG.flocks; j++) {
+        let chunkInd = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
+        while (cathedralChunks.includes(chunkInd)) {
+            chunkInd = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
+        }
         const chunk = MAP_CONFIG.chunks[chunkInd];
 
-        // choose a random position from within the chunk
-        const x = Math.random() * (MAP_CONFIG.chunkDim-3) * 0.8 + 1.5 + chunk.position.x;
-        const z = Math.random() * (MAP_CONFIG.chunkDim-3) * 0.8 + 1.5 + chunk.position.z;
+        for (let k = 0; k < AGENTS_CONFIG.flockSize; k++) {
+            // choose a random position from within the chunk
+            const x = Math.random() * (MAP_CONFIG.chunkDim-3) * 0.8 + 1.5 + chunk.position.x;
+            const z = Math.random() * (MAP_CONFIG.chunkDim-3) * 0.8 + 1.5 + chunk.position.z;
 
-        // set the transform of the object
-        dummy.position.set(x, 12+Math.random()*4, z);
-        dummy.rotation.y = Math.random() * Math.PI;
-        dummy.scale.setScalar(1);
-        
-        dummy.updateMatrix();
+            // set the transform of the object
+            dummy.position.set(x, 12+Math.random()*4, z);
+            dummy.rotation.y = Math.random() * Math.PI;
+            dummy.scale.setScalar(1);
+            
+            dummy.updateMatrix();
 
-        AGENTS_CONFIG.agentInstance.forEach(instance => instance.setMatrixAt(i, dummy.matrix));
-        AGENTS_CONFIG.agentsInRegion[chunkInd*4].push(i);
-        AGENTS_CONFIG.agentToRegion.push(chunkInd*4);
-        AGENTS_CONFIG.agentYCell.push(Math.floor(dummy.position.y/2));
+            AGENTS_CONFIG.agentInstance.forEach(instance => instance.setMatrixAt(i, dummy.matrix));
+            AGENTS_CONFIG.agentsInRegion[chunkInd*4].push(i);
+            AGENTS_CONFIG.agentToRegion.push(chunkInd*4);
+            AGENTS_CONFIG.agentYCell.push(Math.floor(dummy.position.y/2));
 
-        AGENTS_CONFIG.velocities.push(new THREE.Vector3(Math.random(), Math.random(), Math.random()));
-        AGENTS_CONFIG.agentTransforms.push([new THREE.Vector3().copy(dummy.position), new THREE.Vector3().copy(dummy.rotation)]);
+            AGENTS_CONFIG.velocities.push(new THREE.Vector3(Math.random(), Math.random(), Math.random()));
+            AGENTS_CONFIG.agentTransforms.push([new THREE.Vector3().copy(dummy.position), new THREE.Vector3().copy(dummy.rotation)]);
+            i++;
+        }
     }
 
     // create random targets for the agents based on flock
     const offset = (MAP_CONFIG.chunkDim-3) / 2;
-    for (let i = 0; i < AGENTS_CONFIG.flocks; i++) {
+    for (let i = 0; i < AGENTS_CONFIG.flocks; i++) {       
         AGENTS_CONFIG.targetChunks.push(Math.floor(Math.random() * MAP_CONFIG.chunks.length));
+        while (cathedralChunks.includes(AGENTS_CONFIG.targetChunks[i])) {
+            AGENTS_CONFIG.targetChunks[i] = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
+        }
         AGENTS_CONFIG.targetPos.push(new THREE.Vector3().set(MAP_CONFIG.chunks[AGENTS_CONFIG.targetChunks[i]].position.x + offset, 12, MAP_CONFIG.chunks[AGENTS_CONFIG.targetChunks[i]].position.z + offset));
     }
 }
@@ -842,7 +882,7 @@ function updateAgents() {
         updates the velocities and positions of each agent according to the boids laws
     */
     let propellerInd = 0;
-    for (let i = 0; i < AGENTS_CONFIG.count; i++) {
+    for (let i = 0; i < AGENTS_CONFIG.flockSize*AGENTS_CONFIG.flocks; i++) {
         const currentPos = AGENTS_CONFIG.agentTransforms[i][0];
 
         const currentVelocity = AGENTS_CONFIG.velocities[i];
@@ -886,7 +926,7 @@ function updateAgents() {
         }
 
         // find what target this agent has and apply its force
-        const flock = Math.floor(i / (AGENTS_CONFIG.count/AGENTS_CONFIG.flocks));
+        const flock = Math.floor(i / AGENTS_CONFIG.flockSize);
         target.subVectors(AGENTS_CONFIG.targetPos[flock], currentPos);
         const targetDist = target.lengthSq();
 
@@ -927,24 +967,24 @@ function updateAgents() {
         if (agentChunk == 87 || agentChunk == 88) {
             hit = raycaster.intersectObject(cathedral.children[2]);
             if (hit.length > 0) {
-                avoid.sub(hit[0].face.normal);
+                avoid.add(hit[0].face.normal);
             }
             if (force.y < 0) force.y = 0;
         } else if (agentChunk == 103 || agentChunk == 104) {
             hit = raycaster.intersectObjects(cathedralObstacles[0]);
             if (hit.length > 0) {
-                avoid.sub(hit[0].face.normal);
+                avoid.add(hit[0].face.normal);
             }
             if (force.y < 0) force.y = 0;
         } else if (agentChunk == 119 || agentChunk == 120) {
             hit = raycaster.intersectObjects(cathedralObstacles[1]);
             if (hit.length > 0) {
-                avoid.sub(hit[0].face.normal);
+                avoid.add(hit[0].face.normal);
             }
             if (force.y < 0) force.y = 0;
         }
 
-        force.addScaledVector(avoid, -AGENTS_CONFIG.weights[4]);
+        force.addScaledVector(avoid, AGENTS_CONFIG.weights[4]);
 
         // clamp the force and update the velocity
         force.clampLength(0, AGENTS_CONFIG.maxForce);
@@ -981,6 +1021,7 @@ function updateAgents() {
         // calculate the angle change for animation
         const velMag = currentVelocity.lengthSq();
         const currentAngle = Math.atan2(currentVelocity.x, currentVelocity.z);
+
         let angleChange = currentAngle - prevAngle;
         if (velMag < 0.005) {
             // the agents can rapidly turn when stopped so prvent that
@@ -993,11 +1034,13 @@ function updateAgents() {
             angleChange = Math.min(Math.max(angleChange, -Math.PI/4), Math.PI/4);
         }
 
-        const currentRot = AGENTS_CONFIG.agentTransforms[i][1];
-
         // smoothly interpolate the rotation
-        currentRot.y = THREE.MathUtils.lerp(currentRot.y, currentAngle, 0.1);
-        currentRot.z = THREE.MathUtils.lerp(currentRot.z, angleChange*-10, 0.1);
+        const currentRot = AGENTS_CONFIG.agentTransforms[i][1];
+        currentRot.z = THREE.MathUtils.lerp(currentRot.z, angleChange*-15, 0.1);
+
+        // accounts for sign changes aroung Math.PI (formula from https://stackoverflow.com/questions/2708476/rotation-interpolation)
+        angleChange = ((currentAngle - currentRot.y) + Math.PI) % (Math.PI*2) - Math.PI;
+        currentRot.y += angleChange*0.1;
 
         dummy.position.copy(currentPos);
         dummy.scale.set(1, 1, 1+velMag*100);
@@ -1029,7 +1072,7 @@ function targetCheck() {
         // check how many agents are in the target chunk
         const chunkRegions = AGENTS_CONFIG.targetChunks[i]*4;
         const agentCount = AGENTS_CONFIG.agentsInRegion[chunkRegions].length + AGENTS_CONFIG.agentsInRegion[chunkRegions+1].length + AGENTS_CONFIG.agentsInRegion[chunkRegions+2].length + AGENTS_CONFIG.agentsInRegion[chunkRegions+3].length;
-        if (agentCount > 180) {
+        if (agentCount > AGENTS_CONFIG.flockSize-20) {
             // find a new chunk that isn't covered by the cathedral
             AGENTS_CONFIG.targetChunks[i] = Math.floor(Math.random() * MAP_CONFIG.chunks.length);
             while (cathedralChunks.includes(AGENTS_CONFIG.targetChunks[i])) {
@@ -1045,25 +1088,87 @@ function targetCheck() {
 ////////////////////////////////////////////////////////////////////////////
 
 function addBaseLight() {
-    const sun = new THREE.DirectionalLight(COLOURS.WHITE, 1.5);
-    sun.position.set(50, 100, 50);
-    scene.add(sun);
+    /*
+        Adds the basic lighting components of the scene
+    */
+    skyLight = new THREE.DirectionalLight(COLOURS.SUN_YELLOW, 500);
+    skyLight.position.set(50, 100, 50);
+    scene.add(skyLight);
     scene.add(new THREE.AmbientLight(0x606060));
 }
 
+function addSpotlight() {
+    /*
+        creates a spotlight group consisting of a light cone and actual spotlight
+    */
+    const spotlight = new THREE.Group();
+
+    const spotlightGeometry = new THREE.ConeGeometry(22, 80, 32); 
+    spotlightGeometry.translate(0, -40, 0);
+
+    const spotlightMaterial = new THREE.MeshBasicMaterial({color: COLOURS.WHITE, transparent: true, opacity: 0.2, blending: THREE.AdditiveBlending});
+    const spotlightMesh = new THREE.Mesh(spotlightGeometry, spotlightMaterial);
+
+    spotlight.add(spotlightMesh);
+
+    const spotlightTarget = new THREE.Object3D();
+    spotlightTarget.position.set(0, -5, 0)
+
+    const light = new THREE.SpotLight(COLOURS.WHITE, 150, 0, Math.PI/12, 0, 0.75);
+    light.target = spotlightTarget;
+
+    spotlight.add(spotlightTarget);
+    spotlight.add(light);
+
+    return spotlight;
+}
+
+function moveSpotlights(frame) {
+    /*
+        oscillates the rotation of the spotlights
+    */
+    const deviation = Math.sin(frame/360)*0.8;
+
+    spotlights[0].rotation.set(-Math.PI/2.4, Math.PI/3 + deviation, 0);
+    spotlights[1].rotation.set(-Math.PI/2.4, -Math.PI/3 - deviation, 0);
+}
+
+let skyLight;
+let spotlights = [];
+
 scene.background = new THREE.Color(COLOURS.SKY_BLUE);
-scene.fog = new THREE.FogExp2(0x87CEEB, 0.007); 
+scene.fog = new THREE.FogExp2(0x87CEEB, 0.006);
+
+// apply hdr
+renderer.toneMapping = THREE.ACESFilmicToneMapping;
+renderer.toneMappingExposure = 1;
+
+// apply post-processing effects
+const composer = new EffectComposer(renderer);
+
+const renderPass = new RenderPass(scene, camera);
+composer.addPass(renderPass);
+
+const resolution = new THREE.Vector2( window.innerWidth, window.innerHeight );
+const bloomPass = new UnrealBloomPass(resolution, 0.5, 0.4, 0.85);
+bloomPass.enabled = false;
+composer.addPass(bloomPass);
+
+const fxaaPass = new ShaderPass(FXAAShader);
+fxaaPass.uniforms['resolution'].value.set(1/window.innerWidth, 1/window.innerHeight);
+composer.addPass(fxaaPass);
+
+const outputPass = new OutputPass();
+composer.addPass(outputPass);
 
 ////////////////////////////////////////////////////////////////////////////
 // MAIN
 ////////////////////////////////////////////////////////////////////////////
 
 function init() {
-    bvhBounds = new THREE.Group();
-    bvhBounds.visible = STATE.show_bvh;
-    processHeightmap();
     addBaseLight();
-    scene.add(bvhBounds);
+    processHeightmap();
+    setTime();
 }
 
 let frame = 0;
@@ -1078,15 +1183,15 @@ function animate() {
         if (frame % 20 == 0 && mapLoaded) {
             updateChunks();    
             checkImposter();
-            targetCheck();         
-            frame = 0;
+            targetCheck();
         }
 
         updateAgents();
+        if (STATE.night) moveSpotlights(frame);
     } 
     frame++;
 
-    renderer.render(scene, camera);
+    composer.render();
     stats.end();
 }
 
