@@ -178,6 +178,15 @@ function posToChunk(position) {
     return zInd*MAP_CONFIG.chunkCount + xInd;
 }
 
+function posToQuad(position) {
+    /*
+        Returns the chunk index for a given position on the map
+    */
+    const xInd = Math.floor((Math.min(Math.max(position.x, 1), MAP_CONFIG.mapDim-2.1)-1) / (MAP_CONFIG.chunkDim-3));
+    const zInd = Math.floor((Math.min(Math.max(position.z, 1), MAP_CONFIG.mapDim-2.1)-1) / (MAP_CONFIG.chunkDim-3));
+    return zInd*MAP_CONFIG.chunkCount + xInd;
+}
+
 ////////////////////////////////////////////////////////////////////////////
 // MAP
 ////////////////////////////////////////////////////////////////////////////
@@ -320,7 +329,7 @@ function mapInternalSurface(u, v, target, surface, startT, endT) {
 }
 
 const MAP_CONFIG = {
-    heightmap: 'heightmap5.png',
+    heightmap: 'heightmap.png',
     mapDim: 259,
     chunkCount: 16,
     chunkDim: 8,
@@ -397,7 +406,7 @@ function generateMap(heightmap) {
     map.add(tearBlock);
 
     // create a low-res copy of the terrain above it for agent collision
-    const chunkCollision = generateTerrain(data, knots, noise, MAP_CONFIG.chunkColliders, false, 1);
+    const chunkCollision = generateTerrain(data, knots, noise, MAP_CONFIG.chunkColliders, false, 2);
     chunkCollision.position.y = 5;
     chunkCollision.visible = false;
     map.add(chunkCollision);
@@ -429,6 +438,7 @@ function generateMap(heightmap) {
     cathedral.children[6].scale.multiplyScalar(1.2);
     cathedral.visible = false;
     cathedralObstacles = [
+        [cathedral.children[2], cathedral.children[6]],
         [cathedral.children[0], cathedral.children[1], cathedral.children[2], cathedral.children[6]],
         [cathedral.children[0], cathedral.children[1], cathedral.children[6]]
     ]
@@ -772,9 +782,9 @@ const AGENTS_CONFIG = {
     flocks: 8,
     speed: 0.1,
     neighbourDist: 5,
-    weights: [0.01, 0.02, 0.07, 0.15, 0.6],
-    maxForce: 0.075,
-    lookahead: 3,
+    weights: [0.002, 0.02, 0.08, 0.05, 0.3],
+    maxForce: 0.025,
+    lookahead: 4,
     agentInstance: NaN,
     velocities: [],
     agentTransforms: [],
@@ -808,7 +818,7 @@ function createAgents() {
     AGENTS_CONFIG.velocities = [];
     AGENTS_CONFIG.agentTransforms = [];
 
-    AGENTS_CONFIG.agentsInRegion = new Array(MAP_CONFIG.chunkCount*MAP_CONFIG.chunkCount*4).fill().map(() => []);
+    AGENTS_CONFIG.agentsInRegion = new Array(MAP_CONFIG.chunks.length*4).fill().map(() => []);
     AGENTS_CONFIG.agentToRegion = [];
     AGENTS_CONFIG.agentYCell = [];
 
@@ -838,9 +848,13 @@ function createAgents() {
             
             dummy.updateMatrix();
 
+            const xQuad = Math.floor(((dummy.position.x - MAP_CONFIG.chunks[chunkInd].position.x))/((MAP_CONFIG.chunkDim-3)/2));
+            const zQuad = Math.floor(((dummy.position.z - MAP_CONFIG.chunks[chunkInd].position.z))/((MAP_CONFIG.chunkDim-3)/2));
+            const agentRegion = chunkInd * 4 + zQuad * 2 + xQuad;
+
             AGENTS_CONFIG.agentInstance.forEach(instance => instance.setMatrixAt(i, dummy.matrix));
-            AGENTS_CONFIG.agentsInRegion[chunkInd*4].push(i);
-            AGENTS_CONFIG.agentToRegion.push(chunkInd*4);
+            AGENTS_CONFIG.agentsInRegion[agentRegion].push(i);
+            AGENTS_CONFIG.agentToRegion.push(agentRegion);
             AGENTS_CONFIG.agentYCell.push(Math.floor(dummy.position.y/2));
 
             AGENTS_CONFIG.velocities.push(new THREE.Vector3(Math.random(), Math.random(), Math.random()));
@@ -888,6 +902,7 @@ function updateAgents() {
         const currentVelocity = AGENTS_CONFIG.velocities[i];
         const agentRegion = AGENTS_CONFIG.agentToRegion[i];
         const agentChunk = Math.floor(agentRegion/4);
+        const prevAngle = Math.atan2(currentVelocity.x, currentVelocity.z);
 
         // consider each other agent in the same and neighbouring regions
         let neighbours = 0;
@@ -938,6 +953,9 @@ function updateAgents() {
         target.sub(currentVelocity).normalize();
         force.addScaledVector(target, AGENTS_CONFIG.weights[3]);
 
+        force.clampLength(0, AGENTS_CONFIG.maxForce);
+        currentVelocity.addScaledVector(force, AGENTS_CONFIG.speed).clampLength(0, AGENTS_CONFIG.speed);
+
         // set up the raycast
         tempVec.copy(currentPos);
         tempVec2.copy(currentVelocity).normalize();
@@ -965,31 +983,26 @@ function updateAgents() {
 
         // check for relevant cathedral intersections if the agent is in the cathedral chunks
         if (agentChunk == 87 || agentChunk == 88) {
-            hit = raycaster.intersectObject(cathedral.children[2]);
-            if (hit.length > 0) {
-                avoid.add(hit[0].face.normal);
-            }
-            if (force.y < 0) force.y = 0;
-        } else if (agentChunk == 103 || agentChunk == 104) {
             hit = raycaster.intersectObjects(cathedralObstacles[0]);
-            if (hit.length > 0) {
+            if (hit.length > 0 && hit[0].distance < AGENTS_CONFIG.lookahead) {
                 avoid.add(hit[0].face.normal);
             }
-            if (force.y < 0) force.y = 0;
-        } else if (agentChunk == 119 || agentChunk == 120) {
+            if (currentVelocity.y < 0) currentVelocity.y = 0;
+        } else if (agentChunk == 103 || agentChunk == 104) {
             hit = raycaster.intersectObjects(cathedralObstacles[1]);
-            if (hit.length > 0) {
+            if (hit.length > 0 && hit[0].distance < AGENTS_CONFIG.lookahead) {
                 avoid.add(hit[0].face.normal);
             }
-            if (force.y < 0) force.y = 0;
+            if (currentVelocity.y < 0) currentVelocity.y = 0;
+        } else if (agentChunk == 119 || agentChunk == 120) {
+            hit = raycaster.intersectObjects(cathedralObstacles[2]);
+            if (hit.length > 0 && hit[0].distance < AGENTS_CONFIG.lookahead) {
+                avoid.add(hit[0].face.normal);
+            }
+            if (currentVelocity.y < 0) currentVelocity.y = 0;
         }
-
-        force.addScaledVector(avoid, AGENTS_CONFIG.weights[4]);
-
         // clamp the force and update the velocity
-        force.clampLength(0, AGENTS_CONFIG.maxForce);
-        const prevAngle = Math.atan2(currentVelocity.x, currentVelocity.z);
-        currentVelocity.addScaledVector(force, AGENTS_CONFIG.speed).clampLength(0, AGENTS_CONFIG.speed);
+        currentVelocity.addScaledVector(avoid, AGENTS_CONFIG.weights[4]*AGENTS_CONFIG.speed).clampLength(0, AGENTS_CONFIG.speed);
 
         // reset the forces
         force.set(0, 0, 0);
@@ -1001,6 +1014,9 @@ function updateAgents() {
 
         // update the position and find which new chunk the agent is in
         currentPos.add(currentVelocity);
+        currentPos.x = (Math.min(Math.max(currentPos.x, 1), MAP_CONFIG.mapDim-2.1))
+        currentPos.z = (Math.min(Math.max(currentPos.z, 1), MAP_CONFIG.mapDim-2.1))
+
         const newChunkInd = posToChunk(currentPos);
 
         // find which region the agent is in
@@ -1021,10 +1037,11 @@ function updateAgents() {
         // calculate the angle change for animation
         const velMag = currentVelocity.lengthSq();
         const currentAngle = Math.atan2(currentVelocity.x, currentVelocity.z);
+        const currentRot = AGENTS_CONFIG.agentTransforms[i][1];
 
         let angleChange = currentAngle - prevAngle;
         if (velMag < 0.005) {
-            // the agents can rapidly turn when stopped so prvent that
+            // the agents can rapidly turn when stopped so prevent that
             angleChange = 0;
         } else {
             // account for radian bounds
@@ -1032,15 +1049,13 @@ function updateAgents() {
             if (angleChange < -Math.PI) angleChange += Math.PI*2;
             // clamp the maximum visual rotation
             angleChange = Math.min(Math.max(angleChange, -Math.PI/4), Math.PI/4);
+
+            // y rotation doesn't need to be lerped, forces already simulate lerping
+            currentRot.y = currentAngle;
         }
 
-        // smoothly interpolate the rotation
-        const currentRot = AGENTS_CONFIG.agentTransforms[i][1];
-        currentRot.z = THREE.MathUtils.lerp(currentRot.z, angleChange*-15, 0.1);
-
-        // accounts for sign changes aroung Math.PI (formula from https://stackoverflow.com/questions/2708476/rotation-interpolation)
-        angleChange = ((currentAngle - currentRot.y) + Math.PI) % (Math.PI*2) - Math.PI;
-        currentRot.y += angleChange*0.1;
+        // smoothly interpolate the banking
+        currentRot.z = THREE.MathUtils.lerp(currentRot.z, angleChange*-10, 0.05);
 
         dummy.position.copy(currentPos);
         dummy.scale.set(1, 1, 1+velMag*100);
